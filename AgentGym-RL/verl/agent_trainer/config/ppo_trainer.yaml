@@ -35,6 +35,18 @@ actor_rollout_ref:
     ppo_epochs: 1
     shuffle: False
     ulysses_sequence_parallel_size: 1 # sp size
+    # World-model auxiliary SFT (env-observation prediction).
+    # Set world_model_coeff > 0 to enable. Training data is re-assembled from
+    # the rollout messages via the tokenizer's chat template (see
+    # verl.agent_trainer.ppo.world_model_loss) so the model is explicitly
+    # cued to predict the environment's next observation.
+    world_model_coeff: 0.0
+    world_model:
+      enable: False
+      env_predict_prompt: "You are now acting as a world model. Based on the conversation above and the agent's last action, predict the environment's next observation."
+      max_length: 4096
+      max_samples_per_trajectory: null  # null -> keep every env turn
+      min_env_tokens: 1                  # skip degenerate turns with no env tokens
     optim:
       lr: 1e-6
       lr_warmup_steps_ratio: 0.  # the total steps will be injected during runtime

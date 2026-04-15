@@ -24,6 +24,7 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 from verl import DataProto
 from verl.agent_trainer.ppo import core_algos
+from verl.agent_trainer.ppo.world_model_loss import compute_world_model_sft_loss_from_logits
 from verl.workers.agent_actor import BasePPOActor
 from verl.utils.py_functional import append_to_dict
 from verl.utils.torch_functional import logprobs_from_logits, masked_mean
@@ -282,5 +283,66 @@ class DataParallelPPOActor(BasePPOActor):
             grad_norm = self._optimizer_step()
             data = {'actor/grad_norm': grad_norm.detach().item()}
             append_to_dict(metrics, data)
+        self.actor_optimizer.zero_grad()
+        return metrics
+
+    def update_world_model(self, data: DataProto):
+        """SFT update on a freshly assembled world-model batch.
+
+        Expects ``data.batch`` with keys ``input_ids``, ``attention_mask``,
+        ``position_ids`` and ``loss_mask`` (1 on env-observation tokens the
+        model should learn to predict).  The resulting CE loss is scaled by
+        ``self.config.world_model_coeff`` before ``.backward()``.
+        """
+        self.actor_module.train()
+
+        coef = float(self.config.get('world_model_coeff', 0.0))
+        select_keys = ['input_ids', 'attention_mask', 'position_ids', 'loss_mask']
+        batch = data.select(batch_keys=select_keys).batch
+
+        mini_batch_size = self.config.get('world_model_mini_batch_size',
+                                          self.config.ppo_mini_batch_size)
+        micro_batch_size = self.config.get('world_model_micro_batch_size_per_gpu',
+                                           self.config.ppo_micro_batch_size_per_gpu)
+
+        metrics: dict = {}
+        dataloader = batch.split(mini_batch_size) if mini_batch_size else [batch]
+
+        for mini_batch in dataloader:
+            micro_batches = mini_batch.split(micro_batch_size) if micro_batch_size else [mini_batch]
+            gradient_accumulation = max(1, len(micro_batches))
+
+            self.actor_optimizer.zero_grad()
+            for micro in micro_batches:
+                micro = micro.cuda()
+                loss_mask = micro['loss_mask']
+                if loss_mask.sum().item() == 0:
+                    continue
+
+                with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                    output = self.actor_module(
+                        input_ids=micro['input_ids'],
+                        attention_mask=micro['attention_mask'],
+                        position_ids=micro['position_ids'],
+                        use_cache=False,
+                    )
+                    wm_loss = compute_world_model_sft_loss_from_logits(
+                        logits=output.logits,
+                        labels=micro['input_ids'],
+                        loss_mask=loss_mask,
+                    )
+
+                loss = coef * wm_loss / gradient_accumulation
+                loss.backward()
+
+                append_to_dict(metrics, {
+                    'actor/world_model_sft_loss': wm_loss.detach().item(),
+                    'actor/world_model_coef': coef,
+                    'actor/world_model_valid_tokens': loss_mask.sum().detach().item(),
+                })
+
+            grad_norm = self._optimizer_step()
+            append_to_dict(metrics, {'actor/world_model_grad_norm': grad_norm.detach().item()})
+
         self.actor_optimizer.zero_grad()
         return metrics
