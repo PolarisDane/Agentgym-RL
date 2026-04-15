@@ -45,6 +45,7 @@ import os
 import json
 import time
 import requests
+import numpy as np
 from copy import deepcopy
 from verl.utils.model import compute_position_id_with_mask
 from verl.utils.torch_functional import get_eos_mask, pad_sequence_to_length
@@ -361,9 +362,17 @@ class vLLMRollout(BaseRollout):
                 'task_scores': reward_tensor
             },
             batch_size=batch_size)
-        
+
+        # Expose per-sample chat history so downstream passes (e.g. the
+        # world-model SFT update) can re-assemble fresh chat-template data
+        # instead of reusing the rollout sequence in-place.
+        rollout_messages_np = np.empty(batch_size, dtype=object)
+        for i, msgs in enumerate(messages):
+            rollout_messages_np[i] = [m.to_dict() for m in msgs]
+        non_tensor_batch = {'rollout_messages': rollout_messages_np}
+
         # free vllm cache engine
         if self.config.free_cache_engine:
             self.inference_engine.free_cache_engine()
 
-        return DataProto(batch=batch)
+        return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
