@@ -432,6 +432,52 @@ class ActorRolloutRefWorker(Worker):
         return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    def update_actor_world_model(self, data: DataProto):
+        """Run one world-model SFT update on env-prediction data.
+
+        The incoming ``data`` is the output of
+        ``world_model_loss.build_world_model_sft_batch`` packed into a
+        DataProto (expects ``input_ids``/``attention_mask``/``position_ids``/``loss_mask``).
+        """
+        data = data.to('cuda')
+
+        assert self._is_actor
+        if self._is_offload_param:
+            load_fsdp_param_and_grad(module=self.actor_module_fsdp,
+                                     device_id=torch.cuda.current_device(),
+                                     load_grad=self._is_offload_grad)
+        if self._is_offload_optimizer:
+            load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=torch.cuda.current_device())
+
+        data.batch = data.batch.cuda()
+
+        log_gpu_memory_usage('Before update world-model', logger=logger)
+
+        with self.ulysses_sharding_manager:
+            data = self.ulysses_sharding_manager.preprocess_data(data=data)
+            with Timer(name='update_world_model', logger=None) as timer:
+                metrics = self.actor.update_world_model(data=data)
+            delta_time = timer.last
+            metrics['actor/world_model_step_time'] = delta_time
+
+            self.actor_lr_scheduler.step()
+            lr = self.actor_lr_scheduler.get_last_lr()[0]
+            metrics['actor/world_model_lr'] = lr
+
+            log_gpu_memory_usage('After update world-model', logger=logger)
+
+            output = DataProto(meta_info={'metrics': metrics})
+            output = self.ulysses_sharding_manager.postprocess_data(data=output)
+            output = output.to('cpu')
+
+        if self._is_offload_param:
+            offload_fsdp_param_and_grad(module=self.actor_module_fsdp, offload_grad=self._is_offload_grad)
+        if self._is_offload_optimizer:
+            offload_fsdp_optimizer(optimizer=self.actor_optimizer)
+        torch.cuda.empty_cache()
+        return output
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def generate_sequences(self, prompts: DataProto):
         prompts = prompts.to('cuda')
 
