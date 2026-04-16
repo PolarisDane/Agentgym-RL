@@ -746,7 +746,7 @@ class RayPPOTrainer(object):
         assembled = build_world_model_sft_batch(
             messages_list=list(messages_list),
             tokenizer=self.tokenizer,
-            env_predict_prompt=wm_cfg.get('env_predict_prompt', DEFAULT_WORLD_MODEL_PROMPT),
+            env_predict_prompt=wm_cfg.get('env_predict_prompt', None) or DEFAULT_WORLD_MODEL_PROMPT,
             max_length=int(wm_cfg.get('max_length', 4096)),
             max_samples_per_trajectory=wm_cfg.get('max_samples_per_trajectory', None),
             min_env_tokens=int(wm_cfg.get('min_env_tokens', 1)),
