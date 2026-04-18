@@ -43,7 +43,7 @@ actor_rollout_ref:
     world_model_coeff: 0.0
     world_model:
       enable: False
-      env_predict_prompt: "You are now acting as a world model. Based on the conversation above and the agent's last action, predict the environment's next observation."
+      env_predict_prompt: null  # null uses the default prompt defined in world_model_loss.py
       max_length: 4096
       max_samples_per_trajectory: null  # null -> keep every env turn
       min_env_tokens: 1                  # skip degenerate turns with no env tokens

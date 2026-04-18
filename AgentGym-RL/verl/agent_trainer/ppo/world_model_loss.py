@@ -23,7 +23,7 @@ is the objective we actually want from a "world model" auxiliary loss.
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import numpy as np
 import torch
@@ -258,13 +258,11 @@ def compute_world_model_loss(
     attention_mask: torch.Tensor,
     response_mask: torch.Tensor,
     observation_mask: Optional[torch.Tensor] = None,
-) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
-    """Compute observation-token SFT loss used by the world-model objective."""
-    resolved_observation_mask = compute_observation_mask(attention_mask=attention_mask,
-                                                         response_mask=response_mask,
-                                                         observation_mask=observation_mask)
-    if not resolved_observation_mask.any().item():
-        return None, resolved_observation_mask
-
-    wm_sft_loss = -verl_F.masked_mean(log_prob, resolved_observation_mask)
-    return wm_sft_loss, resolved_observation_mask
+):
+    resolved = compute_observation_mask(attention_mask=attention_mask,
+                                        response_mask=response_mask,
+                                        observation_mask=observation_mask)
+    if not resolved.any().item():
+        return None, resolved
+    wm_loss = -verl_F.masked_mean(log_prob, resolved)
+    return wm_loss, resolved
