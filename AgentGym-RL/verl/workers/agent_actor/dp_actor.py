@@ -24,7 +24,10 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 from verl import DataProto
 from verl.agent_trainer.ppo import core_algos
-from verl.agent_trainer.ppo.world_model_loss import compute_world_model_loss, compute_world_model_sft_loss_from_logits
+from verl.agent_trainer.ppo.world_model_loss import (
+    compute_world_model_loss,
+    compute_world_model_sft_loss_from_logits,
+)
 from verl.workers.agent_actor import BasePPOActor
 from verl.utils.py_functional import append_to_dict
 from verl.utils.torch_functional import logprobs_from_logits, masked_mean
@@ -278,12 +281,20 @@ class DataParallelPPOActor(BasePPOActor):
                     metrics['actor/kl_loss'] = kl_loss.detach().item()
                     metrics['actor/kl_coef'] = self.config.kl_loss_coef
 
-                if world_model_coeff > 0:
-                    explicit_observation_mask = data['observation_mask'] if 'observation_mask' in data.keys() else None
-                    wm_sft_loss, _ = compute_world_model_loss(log_prob=log_prob,
-                                                              attention_mask=data['attention_mask'],
-                                                              response_mask=response_mask,
-                                                              observation_mask=explicit_observation_mask)
+                # Legacy in-place world-model SFT term: only fires when the
+                # batch carries an explicit ``observation_mask`` (e.g. tests or
+                # callers that still mask env tokens on the rollout sequence).
+                # The recommended path is the separate ``update_world_model``
+                # pass driven by ``ray_trainer.fit`` on a freshly re-assembled
+                # chat-template batch.
+                if world_model_coeff > 0 and 'observation_mask' in data.keys():
+                    explicit_observation_mask = data['observation_mask']
+                    wm_sft_loss, _ = compute_world_model_loss(
+                        log_prob=log_prob,
+                        attention_mask=data['attention_mask'],
+                        response_mask=response_mask,
+                        observation_mask=explicit_observation_mask,
+                    )
                     if wm_sft_loss is not None:
                         policy_loss = policy_loss + world_model_coeff * wm_sft_loss
                         metrics['actor/wm_sft_loss'] = wm_sft_loss.detach().item()
