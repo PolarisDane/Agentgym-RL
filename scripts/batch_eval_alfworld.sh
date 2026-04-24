@@ -42,7 +42,8 @@ XDG_CACHE_HOME="${XDG_CACHE_HOME:-${ROOT}/tmp_eval/xe}"
 WANDB_DIR="${ROOT}/tmp_eval/we"
 WANDB_CACHE_DIR="${WANDB_CACHE_DIR:-${WANDB_DIR}/.cache}"
 WANDB_CONFIG_DIR="${WANDB_CONFIG_DIR:-${WANDB_DIR}/.config}"
-RAY_TMPDIR="${ROOT}/tmp_eval/ra}"
+# Use /tmp/ray or a shorter path to avoid "AF_UNIX path length cannot exceed 107 bytes" error
+RAY_TMPDIR="/tmp/ray_$(whoami)"
 
 mkdir -p \
   "${TMPDIR}" "${HF_HOME}" "${TRANSFORMERS_CACHE}" "${XDG_CACHE_HOME}" \
