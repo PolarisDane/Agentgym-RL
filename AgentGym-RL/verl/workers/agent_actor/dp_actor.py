@@ -219,7 +219,7 @@ class DataParallelPPOActor(BasePPOActor):
         self.actor_module.train()
 
         temperature = data.meta_info['temperature']  # temperature must be in the data.meta_info to avoid slient error
-        world_model_coeff = self.config.get('world_model_coeff', 0.0)
+        world_model_coeff = data.meta_info.get('world_model_coeff', self.config.get('world_model_coeff', 0.0))
 
         select_keys = ['input_ids', 'attention_mask', 'position_ids', 'old_log_probs', 'advantages', 'responses', 'response_mask']
         if self.config.use_kl_loss:
@@ -331,8 +331,9 @@ class DataParallelPPOActor(BasePPOActor):
         """
         self.actor_module.train()
 
-        coef = float(self.config.get('world_model_coeff', 0.0))
+        coef = data.meta_info.get('world_model_coeff', float(self.config.get('world_model_coeff', 0.0)))
         select_keys = ['input_ids', 'attention_mask', 'position_ids', 'loss_mask']
+
         batch = data.select(batch_keys=select_keys).batch
 
         mini_batch_size = self.config.get('world_model_mini_batch_size',

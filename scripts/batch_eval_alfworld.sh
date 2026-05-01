@@ -8,7 +8,7 @@ CONDA_SH="${CONDA_SH:-/opt/conda/etc/profile.d/conda.sh}"
 TRAIN_ENV="${TRAIN_ENV:-/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/cy/conda_envs/agentgym-rl}"
 
 ENV_ADDR="${ENV_ADDR:-http://127.0.0.1:36001}"
-CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
+CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 RESULTS_FILE="${RESULTS_FILE:-${ROOT}/FinalResults_ALFWorld.jsonl}"
 OVERWRITE_RESULTS="${OVERWRITE_RESULTS:-1}"
 SKIP_DONE_MODELS="${SKIP_DONE_MODELS:-0}"
@@ -26,7 +26,7 @@ EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-64}"
 
 BASE_3B_MODEL_PATH="${BASE_3B_MODEL_PATH:-/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/ziyu/.cache/huggingface/hub/models--Qwen--Qwen2.5-3B-Instruct}"
 BASE_7B_MODEL_PATH="${BASE_7B_MODEL_PATH:-/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/ziyu/.cache/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct}"
-CKPT_ROOT_3B="${CKPT_ROOT_3B:-${ROOT}/checkpoints}"
+CKPT_ROOT_3B="${CKPT_ROOT_3B:-${ROOT}/checkpoints/alfworld_grpo_qwen2.5_3b_wm_clip_20260420_025703}"
 CKPT_ROOT_7B="${CKPT_ROOT_7B:-${ROOT}/checkpoints_7b}"
 
 EVAL_DATA_DIR="${EVAL_DATA_DIR:-${ROOT}/AgentItemId/test}"
@@ -124,10 +124,10 @@ fi
 MODEL_LABELS=()
 MODEL_PATHS=()
 
-MODEL_LABELS+=("base_3b")
-MODEL_PATHS+=("${BASE_3B_MODEL_PATH}")
-MODEL_LABELS+=("base_7b")
-MODEL_PATHS+=("${BASE_7B_MODEL_PATH}")
+# MODEL_LABELS+=("base_3b")
+# MODEL_PATHS+=("${BASE_3B_MODEL_PATH}")
+# MODEL_LABELS+=("base_7b")
+# MODEL_PATHS+=("${BASE_7B_MODEL_PATH}")
 
 mapfile -t CKPTS_3B < <(find "${CKPT_ROOT_3B}" -maxdepth 1 -type d -name 'global_step_*' | sort -V)
 mapfile -t CKPTS_7B < <(find "${CKPT_ROOT_7B}" -maxdepth 1 -type d -name 'global_step_*' | sort -V)

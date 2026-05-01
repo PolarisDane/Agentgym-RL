@@ -23,12 +23,12 @@ PROJECT_NAME="${PROJECT_NAME:-agentgym-alfworld}"
 KL_COEF="${KL_COEF:-0.001}"
 POLICY_LR="${POLICY_LR:-1e-6}"
 ROLLOUT_N="${ROLLOUT_N:-8}"
-TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-4}"
+TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-16}"
 PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-8}"
 PPO_MICRO_BATCH_SIZE_PER_GPU="${PPO_MICRO_BATCH_SIZE_PER_GPU:-1}"
 PPO_EPOCHS="${PPO_EPOCHS:-1}"
 TOTAL_EPOCHS="${TOTAL_EPOCHS:-2}"
-MAX_ROUNDS="${MAX_ROUNDS:-15}"
+MAX_ROUNDS="${MAX_ROUNDS:-20}"
 MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-2048}"
 MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-4096}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-8192}"
@@ -36,7 +36,7 @@ MAX_TOKENS_PER_TURN="${MAX_TOKENS_PER_TURN:-512}"
 ROLLOUT_GPU_MEMORY_UTILIZATION="${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.80}"
 SAVE_FREQ="${SAVE_FREQ:-200}"
 
-ENABLE_ERC="${ENABLE_ERC:-0}"
+ENABLE_ERC="${ENABLE_ERC:-1}"
 ERC_MU_BASE="${ERC_MU_BASE:-1.0}"
 ERC_MU_EXP="${ERC_MU_EXP:-1.5}"
 ERC_ETA_WM="${ERC_ETA_WM:-2.0}"
@@ -50,8 +50,16 @@ if [[ "${ENABLE_ERC}" == "1" ]]; then
   ERC_ENABLE_VALUE="True"
 fi
 
-WMC_COEFF="${WMC_COEFF:-0}"
+WMC_COEFF="${WMC_COEFF:-0.001}"
+WMC_TYPE="${WMC_TYPE:-cutoff}"
+WMC_START_COEFF="${WMC_START_COEFF:-0.001}"
+WMC_END_COEFF="${WMC_END_COEFF:-0.0}"
+WMC_HORIZON="${WMC_HORIZON:-100}"
+WMC_POWER="${WMC_POWER:-2}"
+WMC_CUTOFF_STEP="${WMC_CUTOFF_STEP:-50}"
+
 WM_ENABLE="${WM_ENABLE:-False}"
+
 WM_ENV_PREDICT_PROMPT="${WM_ENV_PREDICT_PROMPT:-null}"
 WM_MAX_LENGTH="${WM_MAX_LENGTH:-4096}"
 WM_MAX_SAMPLES_PER_TRAJECTORY="${WM_MAX_SAMPLES_PER_TRAJECTORY:-null}"
@@ -145,4 +153,10 @@ exec env \
     actor_rollout_ref.actor.world_model.env_predict_prompt="${WM_ENV_PREDICT_PROMPT}" \
     actor_rollout_ref.actor.world_model.max_length="${WM_MAX_LENGTH}" \
     actor_rollout_ref.actor.world_model.max_samples_per_trajectory="${WM_MAX_SAMPLES_PER_TRAJECTORY}" \
-    actor_rollout_ref.actor.world_model.min_env_tokens="${WM_MIN_ENV_TOKENS}"
+    actor_rollout_ref.actor.world_model.min_env_tokens="${WM_MIN_ENV_TOKENS}" \
+    algorithm.world_model_coeff_ctrl.type="${WMC_TYPE}" \
+    algorithm.world_model_coeff_ctrl.start_coeff="${WMC_START_COEFF}" \
+    algorithm.world_model_coeff_ctrl.end_coeff="${WMC_END_COEFF}" \
+    algorithm.world_model_coeff_ctrl.horizon="${WMC_HORIZON}" \
+    algorithm.world_model_coeff_ctrl.power="${WMC_POWER}" \
+    algorithm.world_model_coeff_ctrl.cutoff_step="${WMC_CUTOFF_STEP}"

@@ -187,6 +187,14 @@ algorithm:
   kl_ctrl:
     type: fixed
     kl_coef: 0.001
+  world_model_coeff_ctrl:
+    type: fixed # select from fixed/linear/power/cutoff
+    coeff: ${actor_rollout_ref.actor.world_model_coeff} # for fixed
+    start_coeff: 0.0 # for linear/power/cutoff
+    end_coeff: 1.0 # for linear/power/cutoff
+    horizon: 1000 # for linear/power
+    power: 2.0 # for power
+    cutoff_step: 500 # for cutoff
 
 wmc_erc:
   enable: False

@@ -174,13 +174,13 @@ class MegatronPPOActor(BasePPOActor):
         self._set_mode(train=True)
 
         metrics = {}
-        world_model_coeff = self.config.get("world_model_coeff", 0.0)
         micro_batch_size = self.config.ppo_micro_batch_size_per_gpu
         grad_accum_steps = self.config.ppo_mini_batch_size // micro_batch_size
 
         for mini_batch in dataloader:
             batch = mini_batch.batch
             temperature = mini_batch.meta_info.get("temperature", 1.0)
+            world_model_coeff = mini_batch.meta_info.get("world_model_coeff", self.config.get("world_model_coeff", 0.0))
             self.actor_optimizer.zero_grad()
 
             response_length = batch["responses"].shape[1]

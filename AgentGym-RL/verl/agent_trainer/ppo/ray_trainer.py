@@ -251,6 +251,116 @@ class StepRoundsScheduler(RoundsScheduler):
         return self.max_rounds
 
 
+class WorldModelCoeffScheduler(ABC):
+    @abstractmethod
+    def step(self):
+        raise NotImplementedError
+
+    @abstractmethod
+    def set_global_steps(self, global_steps: int):
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_coeff(self):
+        raise NotImplementedError
+
+
+class FixedWorldModelCoeffScheduler(WorldModelCoeffScheduler):
+    def __init__(self, coeff: float):
+        self.coeff = coeff
+
+    def step(self):
+        pass
+
+    def set_global_steps(self, global_steps: int):
+        pass
+
+    def get_coeff(self):
+        return self.coeff
+
+
+class LinearWorldModelCoeffScheduler(WorldModelCoeffScheduler):
+    def __init__(self, start_coeff: float, end_coeff: float, horizon: int):
+        self.start_coeff = start_coeff
+        self.end_coeff = end_coeff
+        self.horizon = horizon
+        self.current_coeff = start_coeff
+        self.global_steps = 0
+
+    def step(self):
+        self.global_steps += 1
+        self._update()
+
+    def set_global_steps(self, global_steps: int):
+        self.global_steps = global_steps
+        self._update()
+
+    def _update(self):
+        if self.horizon <= 0:
+            self.current_coeff = self.end_coeff
+        else:
+            fraction = min(self.global_steps / self.horizon, 1.0)
+            self.current_coeff = self.start_coeff + fraction * (self.end_coeff - self.start_coeff)
+
+    def get_coeff(self):
+        return self.current_coeff
+
+
+class PowerWorldModelCoeffScheduler(WorldModelCoeffScheduler):
+    def __init__(self, start_coeff: float, end_coeff: float, horizon: int, power: float = 2.0):
+        self.start_coeff = start_coeff
+        self.end_coeff = end_coeff
+        self.horizon = horizon
+        self.power = power
+        self.current_coeff = start_coeff
+        self.global_steps = 0
+
+    def step(self):
+        self.global_steps += 1
+        self._update()
+
+    def set_global_steps(self, global_steps: int):
+        self.global_steps = global_steps
+        self._update()
+
+    def _update(self):
+        if self.horizon <= 0:
+            self.current_coeff = self.end_coeff
+        else:
+            fraction = min(self.global_steps / self.horizon, 1.0)
+            # Use power function for non-linear growth: (step/horizon)^power
+            self.current_coeff = self.start_coeff + (fraction ** self.power) * (self.end_coeff - self.start_coeff)
+
+    def get_coeff(self):
+        return self.current_coeff
+
+
+class CutoffWorldModelCoeffScheduler(WorldModelCoeffScheduler):
+    def __init__(self, start_coeff: float, end_coeff: float, cutoff_step: int):
+        self.start_coeff = start_coeff
+        self.end_coeff = end_coeff
+        self.cutoff_step = cutoff_step
+        self.current_coeff = start_coeff
+        self.global_steps = 0
+
+    def step(self):
+        self.global_steps += 1
+        self._update()
+
+    def set_global_steps(self, global_steps: int):
+        self.global_steps = global_steps
+        self._update()
+
+    def _update(self):
+        if self.global_steps >= self.cutoff_step:
+            self.current_coeff = self.end_coeff
+        else:
+            self.current_coeff = self.start_coeff
+
+    def get_coeff(self):
+        return self.current_coeff
+
+
 def reduce_metrics(metrics: dict):
     for key, val in metrics.items():
         metrics[key] = np.mean(val)
@@ -557,6 +667,35 @@ class RayPPOTrainer(object):
             raise NotImplementedError
         print(f'Total training steps: {self.total_training_steps}')
 
+        # World-model coefficient scheduler
+        wm_coeff_config = self.config.algorithm.get('world_model_coeff_ctrl', None)
+        if wm_coeff_config is None or wm_coeff_config.type == 'fixed':
+            init_coeff = self.config.actor_rollout_ref.actor.get('world_model_coeff', 0.0)
+            if wm_coeff_config is not None:
+                init_coeff = wm_coeff_config.get('coeff', init_coeff)
+            self.world_model_coeff_scheduler = FixedWorldModelCoeffScheduler(coeff=init_coeff)
+        elif wm_coeff_config.type == 'linear':
+            self.world_model_coeff_scheduler = LinearWorldModelCoeffScheduler(
+                start_coeff=wm_coeff_config.start_coeff,
+                end_coeff=wm_coeff_config.end_coeff,
+                horizon=wm_coeff_config.horizon
+            )
+        elif wm_coeff_config.type == 'power':
+            self.world_model_coeff_scheduler = PowerWorldModelCoeffScheduler(
+                start_coeff=wm_coeff_config.start_coeff,
+                end_coeff=wm_coeff_config.end_coeff,
+                horizon=wm_coeff_config.horizon,
+                power=wm_coeff_config.get('power', 2.0)
+            )
+        elif wm_coeff_config.type == 'cutoff':
+            self.world_model_coeff_scheduler = CutoffWorldModelCoeffScheduler(
+                start_coeff=wm_coeff_config.start_coeff,
+                end_coeff=wm_coeff_config.get('end_coeff', 0.0),
+                cutoff_step=wm_coeff_config.cutoff_step
+            )
+        else:
+            raise NotImplementedError
+
         OmegaConf.set_struct(self.config, True)
         with open_dict(self.config):
             self.config.actor_rollout_ref.actor.optim.total_training_steps = total_training_steps
@@ -704,6 +843,7 @@ class RayPPOTrainer(object):
         # set global step
         self.global_steps = int(global_step_folder.split('global_step_')[-1])
         self.rounds_scheduler.set_global_steps(self.global_steps)
+        self.world_model_coeff_scheduler.set_global_steps(self.global_steps)
 
         print(f'Setting global step to {self.global_steps}')
         print(f'Resuming from {global_step_folder}')
@@ -803,6 +943,11 @@ class RayPPOTrainer(object):
                 timing_raw = {}
 
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
+
+                current_wm_coeff = self.world_model_coeff_scheduler.get_coeff()
+                with open_dict(self.config):
+                    self.config.actor_rollout_ref.actor.world_model_coeff = current_wm_coeff
+                batch.meta_info['world_model_coeff'] = current_wm_coeff
 
                 # pop those keys for generation
                 gen_batch = batch.pop(batch_keys=['input_ids', 'attention_mask', 'position_ids'], non_tensor_batch_keys=['item_id', 'raw_prompt'])
@@ -941,6 +1086,7 @@ class RayPPOTrainer(object):
 
                 self.global_steps += 1
                 self.rounds_scheduler.step()
+                self.world_model_coeff_scheduler.step()
 
                 if self.global_steps >= self.total_training_steps:
 
