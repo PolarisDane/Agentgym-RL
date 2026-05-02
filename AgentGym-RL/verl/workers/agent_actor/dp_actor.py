@@ -27,6 +27,7 @@ from verl.agent_trainer.ppo import core_algos
 from verl.agent_trainer.ppo.world_model_loss import (
     compute_world_model_loss,
     compute_world_model_sft_loss_from_logits,
+    compute_observation_mask,
 )
 from verl.workers.agent_actor import BasePPOActor
 from verl.utils.py_functional import append_to_dict
@@ -38,6 +39,34 @@ import verl.utils.torch_functional as verl_F
 from flash_attn.bert_padding import pad_input, unpad_input, rearrange, index_first_axis
 
 __all__ = ['DataParallelPPOActor']
+
+
+def compute_turn_ids(response_mask: torch.Tensor) -> torch.Tensor:
+    """Identify distinct assistant-token turns in the response.
+    
+    Returns a tensor of the same shape as response_mask, where each assistant
+    turn is labeled with a unique ID (0, 1, ...), and non-assistant tokens
+    are ignored.
+    """
+    turn_ids = torch.zeros_like(response_mask, dtype=torch.long)
+    for i in range(response_mask.shape[0]):
+        mask = response_mask[i].bool()
+        if not mask.any():
+            continue
+        
+        # turn_id increments on each 0->1 transition in response_mask
+        turn_id = 0
+        in_turn = False
+        for j in range(len(mask)):
+            if mask[j]:
+                if not in_turn:
+                    if j > 0 and any(mask[:j]): # Increment only after the first turn
+                        turn_id += 1
+                    in_turn = True
+                turn_ids[i, j] = turn_id
+            else:
+                in_turn = False
+    return turn_ids
 
 
 class DataParallelPPOActor(BasePPOActor):
@@ -289,12 +318,45 @@ class DataParallelPPOActor(BasePPOActor):
                 # chat-template batch.
                 if world_model_coeff > 0 and 'observation_mask' in data.keys():
                     explicit_observation_mask = data['observation_mask']
-                    wm_sft_loss, _ = compute_world_model_loss(
-                        log_prob=log_prob,
-                        attention_mask=data['attention_mask'],
-                        response_mask=response_mask,
-                        observation_mask=explicit_observation_mask,
-                    )
+                    
+                    if self.config.get('wm_loss_pi_dedup', False):
+                        obs_mask = compute_observation_mask(
+                            attention_mask=data['attention_mask'],
+                            response_mask=response_mask,
+                            observation_mask=explicit_observation_mask)
+                        
+                        if obs_mask.any().item():
+                            olp = data['old_log_probs'].detach()
+                            t_ids = compute_turn_ids(response_mask)
+                            n_total = int(t_ids.max().item()) + 1 if t_ids.numel() else 1
+                            B = response_mask.size(0)
+                            dt = log_prob.dtype
+                            rm_f = response_mask.to(dt)
+                            
+                            log_pi_sum = torch.zeros(B, n_total, device=olp.device, dtype=dt)
+                            n_act = torch.zeros_like(log_pi_sum)
+                            log_pi_sum.scatter_add_(1, t_ids, olp.to(dt) * rm_f)
+                            n_act.scatter_add_(1, t_ids, rm_f)
+                            
+                            log_pi_mean = log_pi_sum / n_act.clamp(min=1.0)
+                            pi_per_turn = log_pi_mean.exp().clamp(0.0, 1.0)
+                            w_per_turn = (1.0 - pi_per_turn)  # ∈ [0, 1]
+                            w_per_token = w_per_turn.gather(1, t_ids).to(dt)
+                            
+                            obs_mask_w = obs_mask.to(dt) * w_per_token
+                            denom = obs_mask_w.sum().clamp(min=1e-6)
+                            wm_sft_loss = -(log_prob * obs_mask_w).sum() / denom
+                            metrics['actor/wm_sft_pi_dedup_w_mean'] = w_per_turn.mean().detach().item()
+                        else:
+                            wm_sft_loss = None
+                    else:
+                        wm_sft_loss, _ = compute_world_model_loss(
+                            log_prob=log_prob,
+                            attention_mask=data['attention_mask'],
+                            response_mask=response_mask,
+                            observation_mask=explicit_observation_mask,
+                        )
+
                     if wm_sft_loss is not None:
                         policy_loss = policy_loss + world_model_coeff * wm_sft_loss
                         metrics['actor/wm_sft_loss'] = wm_sft_loss.detach().item()
