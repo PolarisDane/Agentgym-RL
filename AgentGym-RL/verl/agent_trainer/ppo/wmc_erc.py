@@ -124,35 +124,51 @@ def compute_dynamic_mask(
     s_bar: float,
     sigma: float,
     clipping_method: str = "mask",
+    h_bar: float = None,
 ) -> List[List[float]]:
-    """Compute per-turn dynamic entropy clipping mask or coefficient."""
-    mask_per_sample = []
-    for i in range(len(s_star_per_sample)):
-        masks = []
-        for t in range(len(s_star_per_sample[i])):
-            s_t = s_star_per_sample[i][t].detach().item()
-            h_t = h_wm_per_sample[i][t].detach().item()
+    """Compute per-turn dynamic entropy mask or clipping coefficient."""
+    mask_per_sample: List[List[float]] = []
 
-            h_factor = eta_wm * np.exp(-lambda_wm * h_t)
+    for sample_idx in range(len(s_star_per_sample)):
+        sample_masks: List[float] = []
+        for turn_idx in range(len(s_star_per_sample[sample_idx])):
+            s_t = s_star_per_sample[sample_idx][turn_idx].detach().item()
+            world_model_loss = h_wm_per_sample[sample_idx][turn_idx].detach().item()
+
+            h_factor = eta_wm * np.exp(-lambda_wm * world_model_loss)
 
             if s_t > s_bar:
                 threshold = mu_base * h_factor * sigma
                 diff = s_t - s_bar
-                if clipping_method == "mask":
-                    m_t = 1.0 if diff <= threshold else 0.0
-                else:
-                    u_t = min(1.0, diff / (threshold + 1e-8))
-                    m_t = 1.0 / (1.0 + 0.5 * u_t)
             else:
                 threshold = mu_exp * h_factor * sigma
                 diff = s_bar - s_t
-                if clipping_method == "mask":
-                    m_t = 1.0 if diff <= threshold else 0.0
-                else:
-                    m_t = 1.0
 
-            masks.append(m_t)
-        mask_per_sample.append(masks)
+            if clipping_method == "mask":
+                m_t = 1.0 if diff <= threshold else 0.0
+            elif clipping_method == "sigmoid":
+                dh = np.clip(world_model_loss - h_bar, -2.0, 2.0)
+                tau = sigma * 0.2 + 1e-8
+                delta = s_t - s_bar
+                if delta > 0:
+                    width = mu_base * np.exp(-lambda_wm * dh) * sigma
+                    m_t = 1.0 / (1.0 + np.exp(max(-500, min(500, (delta - width) / tau))))
+                else:
+                    width = mu_exp * np.exp(lambda_wm * dh) * sigma
+                    m_t = 1.0 / (1.0 + np.exp(max(-500, min(500, (-delta - width) / tau))))
+            elif clipping_method == "gaussian":
+                dh = np.clip(world_model_loss - h_bar, -2.0, 2.0)
+                delta = s_t - s_bar
+                if delta > 0:
+                    width = mu_base * np.exp(-lambda_wm * dh) * sigma
+                else:
+                    width = mu_exp * np.exp(lambda_wm * dh) * sigma
+                m_t = np.exp(-0.5 * delta ** 2 / (width ** 2 + 1e-8))
+            else:
+                m_t = min(1.0, threshold / (diff + 1e-8))
+
+            sample_masks.append(m_t)
+        mask_per_sample.append(sample_masks)
 
     return mask_per_sample
 
@@ -222,6 +238,7 @@ def apply_wmc_erc(
         s_bar=use_s_bar,
         sigma=use_s_std,
         clipping_method=clipping_method,
+        h_bar=running_stats["h_bar"],
     )
 
     batch_size = advantages.shape[0]
