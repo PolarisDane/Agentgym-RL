@@ -12,10 +12,25 @@ TASK_NAME="alfworld"
 export HF_HUB_OFFLINE=1
 export WANDB_MODE=offline
 
-ENV_ADDR="${ENV_ADDR:-http://127.0.0.1:36001}"
+ENV_ADDR_HOST="${ENV_ADDR_HOST:-127.0.0.1}"
+BASE_PORT="${BASE_PORT:-36001}"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 IFS=',' read -r -a GPU_ARRAY <<< "${CUDA_VISIBLE_DEVICES}"
 NUM_GPUS="${#GPU_ARRAY[@]}"
+
+# Automatically construct comma-separated list of environment addresses
+ENV_ADDR_LIST=""
+for i in $(seq 0 $((NUM_GPUS - 1))); do
+  PORT=$((BASE_PORT + i))
+  ADDR="http://${ENV_ADDR_HOST}:${PORT}"
+  if [[ -z "${ENV_ADDR_LIST}" ]]; then
+    ENV_ADDR_LIST="${ADDR}"
+  else
+    ENV_ADDR_LIST="${ENV_ADDR_LIST},${ADDR}"
+  fi
+done
+ENV_ADDR="${ENV_ADDR:-${ENV_ADDR_LIST}}"
+echo "Using ENV_ADDR: ${ENV_ADDR}"
 
 WANDB_MODE="${WANDB_MODE:-offline}"
 PROJECT_NAME="${PROJECT_NAME:-agentgym-alfworld}"
@@ -42,15 +57,16 @@ ERC_MU_EXP="${ERC_MU_EXP:-1.5}"
 ERC_ETA_WM="${ERC_ETA_WM:-2.0}"
 ERC_LAMBDA_WM="${ERC_LAMBDA_WM:-1.0}"
 ERC_CLIPPING_TYPE="${ERC_CLIPPING_TYPE:-global}"
-ERC_CLIPPING_METHOD="${ERC_CLIPPING_METHOD:-gaussian}"
+ERC_CLIPPING_METHOD="${ERC_CLIPPING_METHOD:-add}"
 ERC_MOMENTUM="${ERC_MOMENTUM:-0.9}"
+WMLOSS_ADD_COEF="${WMLOSS_ADD_COEF:--0.3}"
 
 ERC_ENABLE_VALUE="False"
 if [[ "${ENABLE_ERC}" == "1" ]]; then
   ERC_ENABLE_VALUE="True"
 fi
 
-WMC_COEFF="${WMC_COEFF:-0.001}"
+WMC_COEFF="${WMC_COEFF:-0.01}"
 WMC_TYPE="${WMC_TYPE:-fixed}"
 WMC_START_COEFF="${WMC_START_COEFF:-0.001}"
 WMC_END_COEFF="${WMC_END_COEFF:-0.0}"
@@ -59,6 +75,7 @@ WMC_POWER="${WMC_POWER:-2}"
 WMC_CUTOFF_STEP="${WMC_CUTOFF_STEP:-50}"
 
 WM_ENABLE="${WM_ENABLE:-False}"
+WM_LOSS_PI_DEDUP="${WM_LOSS_PI_DEDUP:-True}"
 
 WM_ENV_PREDICT_PROMPT="${WM_ENV_PREDICT_PROMPT:-null}"
 WM_MAX_LENGTH="${WM_MAX_LENGTH:-4096}"
@@ -110,7 +127,7 @@ exec env \
     data.max_prompt_length="${MAX_PROMPT_LENGTH}" \
     data.max_response_length="${MAX_RESPONSE_LENGTH}" \
     actor_rollout_ref.agentgym.task_name="${TASK_NAME}" \
-    actor_rollout_ref.agentgym.env_addr="${ENV_ADDR}" \
+    actor_rollout_ref.agentgym.env_addr="'${ENV_ADDR}'" \
     actor_rollout_ref.agentgym.timeout=2400 \
     actor_rollout_ref.model.path="${MODEL_PATH}" \
     actor_rollout_ref.actor.use_kl_loss=True \
@@ -148,12 +165,14 @@ exec env \
     wmc_erc.clipping_type="${ERC_CLIPPING_TYPE}" \
     wmc_erc.clipping_method="${ERC_CLIPPING_METHOD}" \
     wmc_erc.momentum="${ERC_MOMENTUM}" \
+    +wmc_erc.wmloss_add_coef="${WMLOSS_ADD_COEF}" \
     actor_rollout_ref.actor.world_model_coeff="${WMC_COEFF}" \
     actor_rollout_ref.actor.world_model.enable="${WM_ENABLE}" \
     actor_rollout_ref.actor.world_model.env_predict_prompt="${WM_ENV_PREDICT_PROMPT}" \
     actor_rollout_ref.actor.world_model.max_length="${WM_MAX_LENGTH}" \
     actor_rollout_ref.actor.world_model.max_samples_per_trajectory="${WM_MAX_SAMPLES_PER_TRAJECTORY}" \
     actor_rollout_ref.actor.world_model.min_env_tokens="${WM_MIN_ENV_TOKENS}" \
+    +actor_rollout_ref.actor.wm_loss_pi_dedup="${WM_LOSS_PI_DEDUP}" \
     algorithm.world_model_coeff_ctrl.type="${WMC_TYPE}" \
     algorithm.world_model_coeff_ctrl.start_coeff="${WMC_START_COEFF}" \
     algorithm.world_model_coeff_ctrl.end_coeff="${WMC_END_COEFF}" \

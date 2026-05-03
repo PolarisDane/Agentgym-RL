@@ -10,6 +10,7 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
+import torch.distributed as dist
 
 
 def compute_turn_boundaries(response_mask: torch.Tensor) -> List[List[Tuple[int, int]]]:
@@ -192,6 +193,7 @@ def apply_wmc_erc(
     response_mask = batch.batch["response_mask"]
     old_log_probs = batch.batch["old_log_probs"]
     advantages = batch.batch["advantages"]
+    batch_size = advantages.shape[0]
     response_length = advantages.shape[1]
     attention_mask = batch.batch["attention_mask"]
     attention_mask_response = attention_mask[:, -response_length:]
@@ -228,68 +230,104 @@ def apply_wmc_erc(
         use_s_bar = batch_s_bar
         use_s_std = batch_s_std
 
-    mu_base = float(wmc_erc_config.get("mu_base", 1.0) if hasattr(wmc_erc_config, "get") else getattr(wmc_erc_config, "mu_base", 1.0))
-    mu_exp = float(wmc_erc_config.get("mu_exp", 2.0) if hasattr(wmc_erc_config, "get") else getattr(wmc_erc_config, "mu_exp", 2.0))
-    eta_wm = float(wmc_erc_config.get("eta_wm", 1.0) if hasattr(wmc_erc_config, "get") else getattr(wmc_erc_config, "eta_wm", 1.0))
-    lambda_wm = float(wmc_erc_config.get("lambda_wm", 1.0) if hasattr(wmc_erc_config, "get") else getattr(wmc_erc_config, "lambda_wm", 1.0))
+    if clipping_method == "add":
+        # Additive curiosity bonus: A' = A + coef * max(0, z(wm_loss_per_turn))
+        wmloss_add_coef = float(wmc_erc_config.get("wmloss_add_coef", 0.1))
+        
+        all_h_tensor = torch.tensor(all_h, device=advantages.device, dtype=torch.float32)
+        mu_h = all_h_tensor.mean()
+        sg_h = all_h_tensor.std(unbiased=False).clamp(min=1e-3)
+        
+        if dist.is_available() and dist.is_initialized():
+            stats = torch.stack([mu_h, sg_h])
+            dist.all_reduce(stats, op=dist.ReduceOp.AVG)
+            mu_h, sg_h = stats[0], stats[1].clamp(min=1e-3)
+            
+        offsets_per_sample = []
+        all_offsets = []
+        
+        for i in range(batch_size):
+            sample_offsets = []
+            for t in range(len(h_wm[i])):
+                h_t = h_wm[i][t]
+                z_t = ((h_t - mu_h) / sg_h).clamp(-3.0, 3.0)
+                # z_t = torch.clamp(z_t, min=0.0)
+                offset_t = wmloss_add_coef * z_t
+                sample_offsets.append(offset_t)
+                
+                # Apply to advantages
+                start, end = turn_boundaries[i][t]
+                advantages[i, start:end] += offset_t
+                all_offsets.append(offset_t.item())
+            offsets_per_sample.append(sample_offsets)
+            
+        batch.batch["advantages"] = advantages
+        
+        # Collect add-specific metrics
+        add_metrics = {
+            "wmc_erc/wmloss_offset_mean": float(np.mean(all_offsets)) if all_offsets else 0.0,
+            "wmc_erc/wmloss_offset_std": float(np.std(all_offsets)) if all_offsets else 0.0,
+            "wmc_erc/wmloss_offset_max": float(np.max(all_offsets)) if all_offsets else 0.0,
+            "wmc_erc/wmloss_offset_min": float(np.min(all_offsets)) if all_offsets else 0.0,
+        }
+    else:
+        # Standard multiplicative/masking modes
+        mask = compute_dynamic_mask(
+            s_star, h_wm, mu_base, mu_exp, eta_wm, lambda_wm,
+            s_bar=use_s_bar,
+            sigma=use_s_std,
+            clipping_method=clipping_method,
+            h_bar=running_stats["h_bar"],
+        )
 
-    mask = compute_dynamic_mask(
-        s_star, h_wm, mu_base, mu_exp, eta_wm, lambda_wm,
-        s_bar=use_s_bar,
-        sigma=use_s_std,
-        clipping_method=clipping_method,
-        h_bar=running_stats["h_bar"],
-    )
+        for i in range(batch_size):
+            for t, (start, end) in enumerate(turn_boundaries[i]):
+                if t < len(mask[i]):
+                    m_t = mask[i][t]
 
-    batch_size = advantages.shape[0]
-
-    if inverse_sft_mask:
-        sft_weights = torch.zeros_like(advantages)
-        env_mask = attention_mask_response * (1.0 - response_mask)
-
-    for i in range(batch_size):
-        for t, (start, end) in enumerate(turn_boundaries[i]):
-            if t < len(mask[i]):
-                m_t = mask[i][t]
-
-                if inverse_sft_mask:
-                    if t + 1 < len(turn_boundaries[i]):
-                        env_end = turn_boundaries[i][t + 1][0]
-                    else:
-                        env_end = response_length
-
-                    if m_t == 1.0 and clipping_method != "mask":
-                        sft_weight = 1.0
-                    else:
-                        if m_t > 0.7:
-                            sft_weight = 1.0 - m_t
+                    if inverse_sft_mask:
+                        if t + 1 < len(turn_boundaries[i]):
+                            env_end = turn_boundaries[i][t + 1][0]
                         else:
-                            sft_weight = 2.0 - m_t
-                    region_mask = env_mask[i, end:env_end]
-                    sft_weights[i, end:env_end] = region_mask * sft_weight
+                            env_end = response_length
 
-                if m_t < 1.0:
-                    if clip_positive_only:
-                        turn_adv = advantages[i, start:end]
-                        advantages[i, start:end] = torch.where(turn_adv > 0, turn_adv * m_t, turn_adv)
-                    else:
-                        advantages[i, start:end] *= m_t
-    batch.batch["advantages"] = advantages
+                        if m_t == 1.0 and clipping_method != "mask":
+                            sft_weight = 1.0
+                        else:
+                            if m_t > 0.7:
+                                sft_weight = 1.0 - m_t
+                            else:
+                                sft_weight = 2.0 - m_t
+                        region_mask = env_mask[i, end:env_end]
+                        sft_weights[i, end:env_end] = region_mask * sft_weight
+
+                    if m_t < 1.0:
+                        if clip_positive_only:
+                            turn_adv = advantages[i, start:end]
+                            advantages[i, start:end] = torch.where(turn_adv > 0, turn_adv * m_t, turn_adv)
+                        else:
+                            advantages[i, start:end] *= m_t
+        batch.batch["advantages"] = advantages
+        add_metrics = {}
 
     if inverse_sft_mask:
         batch.batch["sft_weights"] = sft_weights
 
-    all_m = [m for turns in mask for m in turns]
-
-    num_collapsing_violated = 0
-    num_exploration_violated = 0
-    for i in range(len(s_star)):
-        for t in range(len(s_star[i])):
-            if mask[i][t] < 1.0:
-                if s_star[i][t].item() > use_s_bar:
-                    num_collapsing_violated += 1
-                else:
-                    num_exploration_violated += 1
+    if clipping_method != "add":
+        all_m = [m for turns in mask for m in turns]
+        num_collapsing_violated = 0
+        num_exploration_violated = 0
+        for i in range(len(s_star)):
+            for t in range(len(s_star[i])):
+                if mask[i][t] < 1.0:
+                    if s_star[i][t].item() > use_s_bar:
+                        num_collapsing_violated += 1
+                    else:
+                        num_exploration_violated += 1
+    else:
+        all_m = [1.0] # Dummy for add mode
+        num_collapsing_violated = 0
+        num_exploration_violated = 0
 
     env_mask = attention_mask_response * (1.0 - response_mask)
     env_count = env_mask.sum()
@@ -306,8 +344,9 @@ def apply_wmc_erc(
         "wmc_erc/num_violated_turns": sum(1 for m in all_m if m < 1.0),
         "wmc_erc/num_collapsing_violated": num_collapsing_violated,
         "wmc_erc/num_exploration_violated": num_exploration_violated,
-        "wmc_erc/total_turns": len(all_m),
+        "wmc_erc/total_turns": len(all_m) if clipping_method != "add" else len(all_h),
         "wmc_erc/wm_nll": wm_nll,
     }
+    metrics.update(add_metrics)
 
     return batch, metrics
