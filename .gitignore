@@ -6,3 +6,7 @@ items_shuffle.json
 checkpoints
 runlogs
 AgentItemId
+core.*
+tmp_eval/
+**/core.*
+**/tmp_eval/
