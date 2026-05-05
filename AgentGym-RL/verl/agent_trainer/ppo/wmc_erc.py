@@ -73,12 +73,56 @@ def compute_s_star(
 
 
 def compute_h_wm(
+    old_log_probs: torch.Tensor,
+    response_mask: torch.Tensor,
+    attention_mask_response: torch.Tensor,
+    turn_boundaries: List[List[Tuple[int, int]]],
+) -> List[List[torch.Tensor]]:
+    """Compute per-turn World Model Loss (NLL).
+
+    WM_Loss^t = mean negative log-likelihood at env token positions following action turn t.
+    """
+    batch_size = old_log_probs.shape[0]
+    seq_len = old_log_probs.shape[1]
+    device = old_log_probs.device
+    env_mask = attention_mask_response * (1.0 - response_mask)
+
+    h_wm_per_sample = []
+
+    for i in range(batch_size):
+        boundaries = turn_boundaries[i]
+        h_wm_turns = []
+
+        for t, (start, end) in enumerate(boundaries):
+            if t + 1 < len(boundaries):
+                env_end = boundaries[t + 1][0]
+            else:
+                env_end = seq_len
+
+            region_mask = env_mask[i, end:env_end]
+            region_log_prob = old_log_probs[i, end:env_end]
+            count = region_mask.sum()
+
+            if count > 0:
+                # WM Loss is -log_prob
+                h_wm_t = -(region_log_prob * region_mask).sum() / count
+            else:
+                h_wm_t = torch.tensor(0.0, device=device)
+
+            h_wm_turns.append(h_wm_t)
+
+        h_wm_per_sample.append(h_wm_turns)
+
+    return h_wm_per_sample
+
+
+def compute_h_wm_entropy(
     entropys: torch.Tensor,
     response_mask: torch.Tensor,
     attention_mask_response: torch.Tensor,
     turn_boundaries: List[List[Tuple[int, int]]],
 ) -> List[List[torch.Tensor]]:
-    """Compute per-turn World Model uncertainty H_WM.
+    """Compute per-turn World Model Entropy.
 
     H_WM^t = mean prediction entropy at env token positions following action turn t.
     """
@@ -113,6 +157,37 @@ def compute_h_wm(
         h_wm_per_sample.append(h_wm_turns)
 
     return h_wm_per_sample
+
+
+def compute_h_action(
+    entropys: torch.Tensor,
+    response_mask: torch.Tensor,
+    turn_boundaries: List[List[Tuple[int, int]]],
+) -> List[List[torch.Tensor]]:
+    """Compute per-turn mean action entropy.
+
+    H_action^t = mean per-token entropy over action tokens in turn t.
+    """
+    batch_size = entropys.shape[0]
+    device = entropys.device
+    h_action_per_sample = []
+
+    for i in range(batch_size):
+        h_action_turns = []
+        for start, end in turn_boundaries[i]:
+            H = entropys[i, start:end]
+            mask = response_mask[i, start:end]
+            count = mask.sum()
+
+            if count > 0:
+                h_t = (H * mask).sum() / count
+            else:
+                h_t = torch.tensor(0.0, device=device)
+
+            h_action_turns.append(h_t)
+        h_action_per_sample.append(h_action_turns)
+
+    return h_action_per_sample
 
 
 def compute_dynamic_mask(
@@ -179,16 +254,32 @@ def apply_wmc_erc(
     entropys: torch.Tensor,
     wmc_erc_config,
     running_stats: Dict[str, float],
+    step: int = None,
 ):
     """Apply WMC-ERC dynamic entropy clipping to batch advantages."""
     enable = wmc_erc_config.get("enable", True) if hasattr(wmc_erc_config, "get") else getattr(wmc_erc_config, "enable", True)
     if not enable:
         return batch, {}
 
+    if step is not None:
+        running_stats['step'] = step
+    else:
+        running_stats['step'] = running_stats.get('step', 0) + 1
+    current_step = running_stats['step']
+
     clipping_type = wmc_erc_config.get("clipping_type", "batch") if hasattr(wmc_erc_config, "get") else getattr(wmc_erc_config, "clipping_type", "batch")
     clipping_method = wmc_erc_config.get("clipping_method", "mask") if hasattr(wmc_erc_config, "get") else getattr(wmc_erc_config, "clipping_method", "mask")
     clip_positive_only = wmc_erc_config.get("clip_positive_only", False) if hasattr(wmc_erc_config, "get") else getattr(wmc_erc_config, "clip_positive_only", False)
     inverse_sft_mask = wmc_erc_config.get("inverse_sft_mask", False) if hasattr(wmc_erc_config, "get") else getattr(wmc_erc_config, "inverse_sft_mask", False)
+
+    # Success/Failure info
+    wmloss_add_only_failed = bool(wmc_erc_config.get("wmloss_add_only_failed", False))
+    if wmloss_add_only_failed and 'task_scores' in batch.batch.keys():
+        # Sum scores over tokens/turns to get trajectory success
+        traj_scores = batch.batch['task_scores'].sum(dim=-1) # [B]
+        traj_failed = (traj_scores <= 0.0) # only for alfworld, not for sciworld
+    else:
+        traj_failed = torch.ones(batch.batch['advantages'].shape[0], dtype=torch.bool, device=batch.batch['advantages'].device)
 
     response_mask = batch.batch["response_mask"]
     old_log_probs = batch.batch["old_log_probs"]
@@ -201,20 +292,48 @@ def apply_wmc_erc(
     turn_boundaries = compute_turn_boundaries(response_mask)
 
     s_star = compute_s_star(old_log_probs, entropys, response_mask, turn_boundaries)
-    h_wm = compute_h_wm(entropys, response_mask, attention_mask_response, turn_boundaries)
+    h_wm_nll = compute_h_wm(old_log_probs, response_mask, attention_mask_response, turn_boundaries)
+    h_wm_entropy = compute_h_wm_entropy(entropys, response_mask, attention_mask_response, turn_boundaries)
+    h_action = compute_h_action(entropys, response_mask, turn_boundaries)
+
+    ref_entropy = batch.batch.get("ref_entropy", None)
+    if ref_entropy is not None:
+        h_wm_ref = compute_h_wm_entropy(ref_entropy, response_mask, attention_mask_response, turn_boundaries)
+    else:
+        h_wm_ref = None
 
     all_s = [s.item() for turns in s_star for s in turns]
-    all_h = [h.item() for turns in h_wm for h in turns]
+    
+    use_entropy = bool(wmc_erc_config.get("wmloss_add_use_entropy", False))
+    if use_entropy:
+        target_h = h_wm_entropy
+    else:
+        target_h = h_wm_nll
+    
+    all_h = [h.item() for turns in target_h for h in turns]
 
     if not all_s:
         return batch, {}
 
-    batch_s_bar = np.mean(all_s)
-    batch_s_std = np.std(all_s) + 1e-8
-    batch_h_bar = np.mean(all_h) + 1e-8
+    # Sync stats across processes
+    all_s_tensor = torch.tensor(all_s, device=advantages.device, dtype=torch.float32)
+    all_h_tensor = torch.tensor(all_h, device=advantages.device, dtype=torch.float32)
+
+    batch_s_bar_t = all_s_tensor.mean()
+    batch_s_std_t = all_s_tensor.std(correction=0) if len(all_s) > 1 else torch.tensor(0.0, device=advantages.device)
+    batch_h_bar_t = all_h_tensor.mean()
+
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(batch_s_bar_t, op=dist.ReduceOp.AVG)
+        dist.all_reduce(batch_s_std_t, op=dist.ReduceOp.AVG)
+        dist.all_reduce(batch_h_bar_t, op=dist.ReduceOp.AVG)
+
+    batch_s_bar = batch_s_bar_t.item()
+    batch_s_std = batch_s_std_t.item() + 1e-8
+    batch_h_bar = batch_h_bar_t.item() + 1e-8
 
     momentum = wmc_erc_config.get("momentum", 0.9) if hasattr(wmc_erc_config, "get") else getattr(wmc_erc_config, "momentum", 0.9)
-    if len(running_stats.keys()) == 0:
+    if 's_bar' not in running_stats:
         running_stats["s_bar"] = batch_s_bar
         running_stats["s_std"] = batch_s_std
         running_stats["h_bar"] = batch_h_bar
@@ -231,45 +350,172 @@ def apply_wmc_erc(
         use_s_std = batch_s_std
 
     if clipping_method == "add":
-        # Additive curiosity bonus: A' = A + coef * max(0, z(wm_loss_per_turn))
-        wmloss_add_coef = float(wmc_erc_config.get("wmloss_add_coef", 0.1))
+        # Additive curiosity bonus: A' = A + coef * (factor - mean(factor))
+        # factor = clip(0.5, max(0, H_wm - H_wm_mean))
         
-        all_h_tensor = torch.tensor(all_h, device=advantages.device, dtype=torch.float32)
-        mu_h = all_h_tensor.mean()
-        sg_h = all_h_tensor.std(unbiased=False).clamp(min=1e-3)
+        # Linear decay for coef
+        wmloss_add_coef_start = float(wmc_erc_config.get("wmloss_add_coef", 0.1))
+        wmloss_add_coef_end = float(wmc_erc_config.get("wmloss_add_coef_end", wmloss_add_coef_start))
+        wmloss_add_horizon = int(wmc_erc_config.get("wmloss_add_horizon", 1))
         
-        if dist.is_available() and dist.is_initialized():
-            stats = torch.stack([mu_h, sg_h])
-            dist.all_reduce(stats, op=dist.ReduceOp.AVG)
-            mu_h, sg_h = stats[0], stats[1].clamp(min=1e-3)
-            
-        offsets_per_sample = []
+        if wmloss_add_horizon > 0:
+            alpha_decay = min(current_step / wmloss_add_horizon, 1.0)
+            wmloss_add_coef = wmloss_add_coef_start + alpha_decay * (wmloss_add_coef_end - wmloss_add_coef_start)
+        else:
+            wmloss_add_coef = wmloss_add_coef_start
+
+        wmloss_add_use_grouped = bool(wmc_erc_config.get("wmloss_add_use_grouped", False))
+        wmloss_add_use_ref_baseline = bool(wmc_erc_config.get("wmloss_add_use_ref_baseline", False))
+        has_group_id = 'group_id' in batch.batch.keys()
+
         all_offsets = []
-        
-        for i in range(batch_size):
-            sample_offsets = []
-            for t in range(len(h_wm[i])):
-                h_t = h_wm[i][t]
-                z_t = ((h_t - mu_h) / sg_h).clamp(-3.0, 3.0)
-                # z_t = torch.clamp(z_t, min=0.0)
-                offset_t = wmloss_add_coef * z_t
-                sample_offsets.append(offset_t)
-                
-                # Apply to advantages
-                start, end = turn_boundaries[i][t]
-                advantages[i, start:end] += offset_t
-                all_offsets.append(offset_t.item())
-            offsets_per_sample.append(sample_offsets)
+        add_metrics = {}
+
+        if wmloss_add_use_ref_baseline and h_wm_ref is not None:
+            # Formula: offset_t = alpha * 1[failed] * clamp(H_wm - H_ref, 0, 0.5)
+            # No recentering as per request
+            for i in range(batch_size):
+                if not traj_failed[i]:
+                    continue
+                for t in range(len(target_h[i])):
+                    h_val = target_h[i][t]
+                    h_ref_val = h_wm_ref[i][t]
+                    
+                    factor_t = torch.clamp(h_val - h_ref_val, min=0.0, max=0.5)
+                    offset_t = wmloss_add_coef * factor_t
+                    
+                    start, end = turn_boundaries[i][t]
+                    advantages[i, start:end] += offset_t
+                    all_offsets.append(offset_t.item())
             
-        batch.batch["advantages"] = advantages
+            # Metrics for Ref Baseline
+            all_h_ref = [h.item() for turns in h_wm_ref for h in turns]
+            if all_h_ref:
+                add_metrics.update({
+                    "wmc_erc/h_wm_ref_mean": float(np.mean(all_h_ref)),
+                    "wmc_erc/h_wm_ref_std": float(np.std(all_h_ref)),
+                })
+
+        elif wmloss_add_use_grouped and has_group_id:
+            gids = batch.batch['group_id'].long()
+            g_max_local = gids.max() if gids.numel() > 0 else torch.tensor(-1, device=gids.device, dtype=torch.long)
+            if dist.is_available() and dist.is_initialized():
+                dist.all_reduce(g_max_local, op=dist.ReduceOp.MAX)
+            G = int(g_max_local.item()) + 1
+            
+            flat_h = []
+            flat_gids = []
+            for i in range(batch_size):
+                if not traj_failed[i]:
+                    continue
+                for h_val in target_h[i]:
+                    flat_h.append(h_val)
+                    flat_gids.append(gids[i])
+            
+            if flat_h:
+                flat_h_tensor = torch.stack(flat_h)
+                flat_gids_tensor = torch.stack(flat_gids)
+                
+                sum_per_g = torch.zeros(G, dtype=flat_h_tensor.dtype, device=flat_h_tensor.device)
+                cnt_per_g = torch.zeros(G, dtype=flat_h_tensor.dtype, device=flat_h_tensor.device)
+                sum_per_g.scatter_add_(0, flat_gids_tensor, flat_h_tensor)
+                cnt_per_g.scatter_add_(0, flat_gids_tensor, torch.ones_like(flat_h_tensor))
+                
+                if dist.is_available() and dist.is_initialized():
+                    dist.all_reduce(sum_per_g, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(cnt_per_g, op=dist.ReduceOp.SUM)
+                
+                mu_per_g = sum_per_g / cnt_per_g.clamp(min=1.0)
+                
+                # Compute factors
+                factor_per_sample = []
+                all_factors = []
+                for i in range(batch_size):
+                    sample_factors = []
+                    if not traj_failed[i]:
+                        factor_per_sample.append(sample_factors)
+                        continue
+                    gid = gids[i].item()
+                    mu_h_g = mu_per_g[gid]
+                    for h_val in target_h[i]:
+                        factor_t = torch.clamp(h_val - mu_h_g, min=0.0, max=0.5)
+                        sample_factors.append(factor_t)
+                        all_factors.append(factor_t)
+                    factor_per_sample.append(sample_factors)
+                
+                # Compute grouped mean of factors
+                if all_factors:
+                    all_factors_tensor = torch.stack(all_factors)
+                    sum_fac_per_g = torch.zeros(G, dtype=all_factors_tensor.dtype, device=all_factors_tensor.device)
+                    sum_fac_per_g.scatter_add_(0, flat_gids_tensor, all_factors_tensor)
+                    if dist.is_available() and dist.is_initialized():
+                        dist.all_reduce(sum_fac_per_g, op=dist.ReduceOp.SUM)
+                    mu_fac_per_g = sum_fac_per_g / cnt_per_g.clamp(min=1.0)
+                    
+                    # Apply grouped offset
+                    for i in range(batch_size):
+                        if not traj_failed[i]:
+                            continue
+                        gid = gids[i].item()
+                        mu_fac_g = mu_fac_per_g[gid]
+                        for t in range(len(factor_per_sample[i])):
+                            offset_t = wmloss_add_coef * (factor_per_sample[i][t] - mu_fac_g)
+                            start, end = turn_boundaries[i][t]
+                            advantages[i, start:end] += offset_t
+                            all_offsets.append(offset_t.item())
+                
+                add_metrics.update({
+                    "wmc_erc/wmloss_mu_per_group_mean": mu_per_g[cnt_per_g > 0].mean().item() if (cnt_per_g > 0).any() else 0.0,
+                    "wmc_erc/wmloss_mu_per_group_std": mu_per_g[cnt_per_g > 0].std(unbiased=False).item() if (cnt_per_g > 0).sum() > 1 else 0.0,
+                })
+        else:
+            # Fallback to Global or EMA
+            wmloss_add_use_ema = bool(wmc_erc_config.get("wmloss_add_use_ema", False))
+            mu_h = running_stats["h_bar"] if wmloss_add_use_ema else batch_h_bar
+            
+            factor_per_sample = []
+            all_factors = []
+            for i in range(batch_size):
+                sample_factors = []
+                if not traj_failed[i]:
+                    factor_per_sample.append(sample_factors)
+                    continue
+                for t in range(len(target_h[i])):
+                    h_val = target_h[i][t]
+                    factor_t = torch.clamp(h_val - mu_h, min=0.0)
+                    sample_factors.append(factor_t)
+                    all_factors.append(factor_t)
+                factor_per_sample.append(sample_factors)
+                
+            if all_factors:
+                all_factors_tensor = torch.stack(all_factors)
+                mu_fac = all_factors_tensor.mean()
+                if dist.is_available() and dist.is_initialized():
+                    dist.all_reduce(mu_fac, op=dist.ReduceOp.AVG)
+                
+                for i in range(batch_size):
+                    if not traj_failed[i]:
+                        continue
+                    for t in range(len(factor_per_sample[i])):
+                        offset_t = wmloss_add_coef * (factor_per_sample[i][t] - mu_fac)
+                        start, end = turn_boundaries[i][t]
+                        advantages[i, start:end] += offset_t
+                        all_offsets.append(offset_t.item())
+
+        if all_offsets:
+            batch.batch["advantages"] = advantages
+            add_metrics.update({
+                "wmc_erc/wmloss_offset_mean": float(np.mean(all_offsets)),
+                "wmc_erc/wmloss_offset_std": float(np.std(all_offsets)),
+                "wmc_erc/wmloss_offset_max": float(np.max(all_offsets)),
+                "wmc_erc/wmloss_offset_min": float(np.min(all_offsets)),
+                "wmc_erc/wmloss_coef": float(wmloss_add_coef),
+            })
+        else:
+            add_metrics = {}
         
-        # Collect add-specific metrics
-        add_metrics = {
-            "wmc_erc/wmloss_offset_mean": float(np.mean(all_offsets)) if all_offsets else 0.0,
-            "wmc_erc/wmloss_offset_std": float(np.std(all_offsets)) if all_offsets else 0.0,
-            "wmc_erc/wmloss_offset_max": float(np.max(all_offsets)) if all_offsets else 0.0,
-            "wmc_erc/wmloss_offset_min": float(np.min(all_offsets)) if all_offsets else 0.0,
-        }
+        # Track number of failed trajectories
+        add_metrics["wmc_erc/num_failed_trajs"] = int(traj_failed.sum().item())
     else:
         # Standard multiplicative/masking modes
         mask = compute_dynamic_mask(

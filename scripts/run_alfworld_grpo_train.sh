@@ -36,9 +36,10 @@ WANDB_MODE="${WANDB_MODE:-offline}"
 PROJECT_NAME="${PROJECT_NAME:-agentgym-alfworld}"
 
 KL_COEF="${KL_COEF:-0.001}"
+ENTROPY_COEF="${ENTROPY_COEF:-0.001}"
 POLICY_LR="${POLICY_LR:-1e-6}"
 ROLLOUT_N="${ROLLOUT_N:-8}"
-TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-16}"
+TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:8}"
 PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-8}"
 PPO_MICRO_BATCH_SIZE_PER_GPU="${PPO_MICRO_BATCH_SIZE_PER_GPU:-1}"
 PPO_EPOCHS="${PPO_EPOCHS:-1}"
@@ -49,17 +50,24 @@ MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-4096}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-8192}"
 MAX_TOKENS_PER_TURN="${MAX_TOKENS_PER_TURN:-512}"
 ROLLOUT_GPU_MEMORY_UTILIZATION="${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.80}"
-SAVE_FREQ="${SAVE_FREQ:-200}"
+SAVE_FREQ="${SAVE_FREQ:-50}"
 
-ENABLE_ERC="${ENABLE_ERC:-1}"
+ENABLE_ERC="${ENABLE_ERC:-0}"
 ERC_MU_BASE="${ERC_MU_BASE:-1.0}"
 ERC_MU_EXP="${ERC_MU_EXP:-1.5}"
 ERC_ETA_WM="${ERC_ETA_WM:-2.0}"
 ERC_LAMBDA_WM="${ERC_LAMBDA_WM:-1.0}"
 ERC_CLIPPING_TYPE="${ERC_CLIPPING_TYPE:-global}"
 ERC_CLIPPING_METHOD="${ERC_CLIPPING_METHOD:-add}"
-ERC_MOMENTUM="${ERC_MOMENTUM:-0.9}"
-WMLOSS_ADD_COEF="${WMLOSS_ADD_COEF:--0.3}"
+ERC_MOMENTUM="${ERC_MOMENTUM:-0.5}"
+WMLOSS_ADD_COEF="${WMLOSS_ADD_COEF:-0.5}"
+WMLOSS_ADD_COEF_END="${WMLOSS_ADD_COEF_END:-0}"
+WMLOSS_ADD_HORIZON="${WMLOSS_ADD_HORIZON:-0}"
+WMLOSS_ADD_USE_ENTROPY="${WMLOSS_ADD_USE_ENTROPY:-True}"
+WMLOSS_ADD_USE_EMA="${WMLOSS_ADD_USE_EMA:-False}"
+WMLOSS_ADD_USE_GROUPED="${WMLOSS_ADD_USE_GROUPED:-False}"
+WMLOSS_ADD_USE_REF_BASELINE="${WMLOSS_ADD_USE_REF_BASELINE:-False}"
+WMLOSS_ADD_ONLY_FAILED="${WMLOSS_ADD_ONLY_FAILED:-True}"
 
 ERC_ENABLE_VALUE="False"
 if [[ "${ENABLE_ERC}" == "1" ]]; then
@@ -133,6 +141,7 @@ exec env \
     actor_rollout_ref.actor.use_kl_loss=True \
     actor_rollout_ref.actor.kl_loss_coef="${KL_COEF}" \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
+    actor_rollout_ref.actor.entropy_coeff=${ENTROPY_COEF} \
     actor_rollout_ref.actor.ppo_epochs="${PPO_EPOCHS}" \
     actor_rollout_ref.actor.optim.lr="${POLICY_LR}" \
     actor_rollout_ref.actor.ppo_mini_batch_size="${PPO_MINI_BATCH_SIZE}" \
@@ -166,6 +175,13 @@ exec env \
     wmc_erc.clipping_method="${ERC_CLIPPING_METHOD}" \
     wmc_erc.momentum="${ERC_MOMENTUM}" \
     +wmc_erc.wmloss_add_coef="${WMLOSS_ADD_COEF}" \
+    +wmc_erc.wmloss_add_use_entropy="${WMLOSS_ADD_USE_ENTROPY}" \
+    +wmc_erc.wmloss_add_use_ema="${WMLOSS_ADD_USE_EMA}" \
+    +wmc_erc.wmloss_add_use_grouped="${WMLOSS_ADD_USE_GROUPED}" \
+    +wmc_erc.wmloss_add_use_ref_baseline="${WMLOSS_ADD_USE_REF_BASELINE}" \
+    +wmc_erc.wmloss_add_only_failed="${WMLOSS_ADD_ONLY_FAILED}" \
+    +wmc_erc.wmloss_add_coef_end="${WMLOSS_ADD_COEF_END}" \
+    +wmc_erc.wmloss_add_horizon="${WMLOSS_ADD_HORIZON}" \
     actor_rollout_ref.actor.world_model_coeff="${WMC_COEFF}" \
     actor_rollout_ref.actor.world_model.enable="${WM_ENABLE}" \
     actor_rollout_ref.actor.world_model.env_predict_prompt="${WM_ENV_PREDICT_PROMPT}" \

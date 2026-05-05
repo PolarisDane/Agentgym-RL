@@ -1036,7 +1036,8 @@ class RayPPOTrainer(object):
                             batch, wmc_metrics = apply_wmc_erc(batch=batch,
                                                                entropys=batch.batch['entropys'],
                                                                wmc_erc_config=self.wmc_erc_config,
-                                                               running_stats=self.wmc_erc_running_stats)
+                                                               running_stats=self.wmc_erc_running_stats,
+                                                               step=self.global_steps)
                             metrics.update(wmc_metrics)
                         if 'entropys' in batch.batch.keys():
                             batch.batch.pop('entropys')
