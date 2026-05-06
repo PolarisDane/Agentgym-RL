@@ -4,53 +4,93 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TRAIN_CODE_DIR="${ROOT}/AgentGym-RL"
-CONDA_SH="${CONDA_SH:-/home/yexuyan/miniconda3/etc/profile.d/conda.sh}"
-TRAIN_ENV="${TRAIN_ENV:-/idfsdata/yexuyan/conda_envs/agentgym-rl-webshop}"
-MODEL_PATH="${MODEL_PATH:-${ROOT}/models/Qwen2.5-3B-Instruct}"
+CONDA_SH="${CONDA_SH:-/opt/conda/etc/profile.d/conda.sh}"
+TRAIN_ENV="${TRAIN_ENV:-/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/cy/conda_envs/agentgym-rl}"
+MODEL_PATH="${MODEL_PATH:-/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/ziyu/.cache/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28}"
 TASK_NAME="webshop"
 
-ENV_ADDR="${ENV_ADDR:-http://127.0.0.1:8013}"
-CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-4,5,6,7}"
+export HF_HUB_OFFLINE=1
+export WANDB_MODE=offline
+
+ENV_ADDR_HOST="${ENV_ADDR_HOST:-127.0.0.1}"
+BASE_PORT="${BASE_PORT:-36001}"
+CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 IFS=',' read -r -a GPU_ARRAY <<< "${CUDA_VISIBLE_DEVICES}"
 NUM_GPUS="${#GPU_ARRAY[@]}"
-if (( NUM_GPUS < 1 )); then
-  echo "CUDA_VISIBLE_DEVICES is empty."
-  exit 1
-fi
+
+# Automatically construct comma-separated list of environment addresses
+ENV_ADDR_LIST=""
+for i in $(seq 0 $((NUM_GPUS - 1))); do
+  PORT=$((BASE_PORT + i))
+  ADDR="http://${ENV_ADDR_HOST}:${PORT}"
+  if [[ -z "${ENV_ADDR_LIST}" ]]; then
+    ENV_ADDR_LIST="${ADDR}"
+  else
+    ENV_ADDR_LIST="${ENV_ADDR_LIST},${ADDR}"
+  fi
+done
+ENV_ADDR="${ENV_ADDR:-${ENV_ADDR_LIST}}"
+echo "Using ENV_ADDR: ${ENV_ADDR}"
 
 WANDB_MODE="${WANDB_MODE:-offline}"
 PROJECT_NAME="${PROJECT_NAME:-agentgym-webshop}"
 
 KL_COEF="${KL_COEF:-0.001}"
+ENTROPY_COEF="${ENTROPY_COEF:-0.001}"
 POLICY_LR="${POLICY_LR:-1e-6}"
 ROLLOUT_N="${ROLLOUT_N:-8}"
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-16}"
 PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-8}"
 PPO_MICRO_BATCH_SIZE_PER_GPU="${PPO_MICRO_BATCH_SIZE_PER_GPU:-1}"
-PPO_EPOCHS="${PPO_EPOCHS:-2}"
+PPO_EPOCHS="${PPO_EPOCHS:-1}"
 TOTAL_EPOCHS="${TOTAL_EPOCHS:-2}"
 MAX_ROUNDS="${MAX_ROUNDS:-15}"
 MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-768}"
-MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-8192}"
-MAX_MODEL_LEN="${MAX_MODEL_LEN:-16384}"
+MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-2048}"
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-4096}"
 MAX_TOKENS_PER_TURN="${MAX_TOKENS_PER_TURN:-256}"
-ROLLOUT_GPU_MEMORY_UTILIZATION="${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.60}"
-SAVE_FREQ="${SAVE_FREQ:-200}"
-REMOVE_PREVIOUS_CKPT_IN_SAVE="${REMOVE_PREVIOUS_CKPT_IN_SAVE:-0}"
-MAX_LOCAL_CKPT_TO_KEEP="${MAX_LOCAL_CKPT_TO_KEEP:-10}"
+ROLLOUT_GPU_MEMORY_UTILIZATION="${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.80}"
+SAVE_FREQ="${SAVE_FREQ:-50}"
 
-ENABLE_WMC="${ENABLE_WMC:-0}"
-WMC_COEFF="${WMC_COEFF:-1e-4}"
 ENABLE_ERC="${ENABLE_ERC:-0}"
 ERC_MU_BASE="${ERC_MU_BASE:-1.0}"
-ERC_MU_EXP="${ERC_MU_EXP:-2.0}"
-ERC_ETA_WM="${ERC_ETA_WM:-3.0}"
+ERC_MU_EXP="${ERC_MU_EXP:-1.5}"
+ERC_ETA_WM="${ERC_ETA_WM:-2.0}"
 ERC_LAMBDA_WM="${ERC_LAMBDA_WM:-1.0}"
 ERC_CLIPPING_TYPE="${ERC_CLIPPING_TYPE:-global}"
-ERC_CLIPPING_METHOD="${ERC_CLIPPING_METHOD:-mask}"
-ERC_MOMENTUM="${ERC_MOMENTUM:-0.9}"
+ERC_CLIPPING_METHOD="${ERC_CLIPPING_METHOD:-add}"
+ERC_MOMENTUM="${ERC_MOMENTUM:-0.5}"
+WMLOSS_ADD_COEF="${WMLOSS_ADD_COEF:-0.2}"
+WMLOSS_ADD_COEF_END="${WMLOSS_ADD_COEF_END:-0}"
+WMLOSS_ADD_HORIZON="${WMLOSS_ADD_HORIZON:-0}"
+WMLOSS_ADD_USE_ENTROPY="${WMLOSS_ADD_USE_ENTROPY:-True}"
+WMLOSS_ADD_USE_EMA="${WMLOSS_ADD_USE_EMA:-False}"
+WMLOSS_ADD_USE_GROUPED="${WMLOSS_ADD_USE_GROUPED:-False}"
+WMLOSS_ADD_USE_REF_BASELINE="${WMLOSS_ADD_USE_REF_BASELINE:-True}"
+WMLOSS_ADD_ONLY_FAILED="${WMLOSS_ADD_ONLY_FAILED:-True}"
 
-EXP_NAME="${EXP_NAME:-webshop_grpo_$(basename "${MODEL_PATH}")_$(date -u +%Y%m%d_%H%M%S)}"
+ERC_ENABLE_VALUE="False"
+if [[ "${ENABLE_ERC}" == "1" ]]; then
+  ERC_ENABLE_VALUE="True"
+fi
+
+WMC_COEFF="${WMC_COEFF:-0.01}"
+WMC_TYPE="${WMC_TYPE:-fixed}"
+WMC_START_COEFF="${WMC_START_COEFF:-0.001}"
+WMC_END_COEFF="${WMC_END_COEFF:-0.0}"
+WMC_HORIZON="${WMC_HORIZON:-100}"
+WMC_POWER="${WMC_POWER:-2}"
+WMC_CUTOFF_STEP="${WMC_CUTOFF_STEP:-50}"
+
+WM_ENABLE="${WM_ENABLE:-False}"
+WM_LOSS_PI_DEDUP="${WM_LOSS_PI_DEDUP:-True}"
+
+WM_ENV_PREDICT_PROMPT="${WM_ENV_PREDICT_PROMPT:-null}"
+WM_MAX_LENGTH="${WM_MAX_LENGTH:-4096}"
+WM_MAX_SAMPLES_PER_TRAJECTORY="${WM_MAX_SAMPLES_PER_TRAJECTORY:-null}"
+WM_MIN_ENV_TOKENS="${WM_MIN_ENV_TOKENS:-1}"
+
+EXP_NAME="${EXP_NAME:-webshop_grpo_qwen2.5_3b_$(date -u +%Y%m%d_%H%M%S)}"
 CKPT_DIR="${CKPT_DIR:-${ROOT}/checkpoints/${EXP_NAME}}"
 RUN_DIR="${RUN_DIR:-${ROOT}/runlogs/${EXP_NAME}}"
 ROLLOUT_LOG_DIR="${ROLLOUT_LOG_DIR:-${RUN_DIR}/rollout_logs}"
@@ -63,34 +103,10 @@ if [[ -n "${LOG_PATH}" ]]; then
   exec >"${LOG_PATH}" 2>&1
 fi
 
-REAL_TRAIN_BATCH_SIZE=$(( TRAIN_BATCH_SIZE * ROLLOUT_N ))
-if (( REAL_TRAIN_BATCH_SIZE % NUM_GPUS != 0 )); then
-  echo "train_batch_size * rollout_n must be divisible by number of visible GPUs."
-  echo "train_batch_size=${TRAIN_BATCH_SIZE}, rollout_n=${ROLLOUT_N}, num_gpus=${NUM_GPUS}"
-  exit 1
-fi
-
 source "${CONDA_SH}"
 set +u
 conda activate "${TRAIN_ENV}"
 set -u
-
-python "${ROOT}/scripts/prepare_webshop_grpo_splits.py"
-
-WMC_COEFF_VALUE="0.0"
-if [[ "${ENABLE_WMC}" == "1" ]]; then
-  WMC_COEFF_VALUE="${WMC_COEFF}"
-fi
-
-ERC_ENABLE_VALUE="False"
-if [[ "${ENABLE_ERC}" == "1" ]]; then
-  ERC_ENABLE_VALUE="True"
-fi
-
-REMOVE_PREVIOUS_CKPT_IN_SAVE_VALUE="False"
-if [[ "${REMOVE_PREVIOUS_CKPT_IN_SAVE}" == "1" ]]; then
-  REMOVE_PREVIOUS_CKPT_IN_SAVE_VALUE="True"
-fi
 
 export NO_PROXY="${NO_PROXY:-127.0.0.1,localhost}"
 export no_proxy="${no_proxy:-127.0.0.1,localhost}"
@@ -117,13 +133,13 @@ exec env \
     data.max_prompt_length="${MAX_PROMPT_LENGTH}" \
     data.max_response_length="${MAX_RESPONSE_LENGTH}" \
     actor_rollout_ref.agentgym.task_name="${TASK_NAME}" \
-    actor_rollout_ref.agentgym.env_addr="${ENV_ADDR}" \
+    actor_rollout_ref.agentgym.env_addr="'${ENV_ADDR}'" \
     actor_rollout_ref.agentgym.timeout=2400 \
     actor_rollout_ref.model.path="${MODEL_PATH}" \
     actor_rollout_ref.actor.use_kl_loss=True \
     actor_rollout_ref.actor.kl_loss_coef="${KL_COEF}" \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
-    actor_rollout_ref.actor.world_model_coeff="${WMC_COEFF_VALUE}" \
+    actor_rollout_ref.actor.entropy_coeff=${ENTROPY_COEF} \
     actor_rollout_ref.actor.ppo_epochs="${PPO_EPOCHS}" \
     actor_rollout_ref.actor.optim.lr="${POLICY_LR}" \
     actor_rollout_ref.actor.ppo_mini_batch_size="${PPO_MINI_BATCH_SIZE}" \
@@ -138,13 +154,16 @@ exec env \
     actor_rollout_ref.rollout.n="${ROLLOUT_N}" \
     actor_rollout_ref.rollout.max_model_len="${MAX_MODEL_LEN}" \
     actor_rollout_ref.rollout.max_tokens="${MAX_TOKENS_PER_TURN}" \
-    actor_rollout_ref.rollout.max_num_batched_tokens=16384 \
-    actor_rollout_ref.rollout.max_num_seqs=128 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
-    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.rollout.rollout_log_dir="${ROLLOUT_LOG_DIR}" \
-    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
     algorithm.kl_ctrl.kl_coef="${KL_COEF}" \
+    trainer.project_name="${PROJECT_NAME}" \
+    trainer.experiment_name="${EXP_NAME}" \
+    trainer.default_local_dir="${CKPT_DIR}" \
+    trainer.save_freq="${SAVE_FREQ}" \
+    trainer.total_epochs="${TOTAL_EPOCHS}" \
+    trainer.nnodes=1 \
+    trainer.n_gpus_per_node="${NUM_GPUS}" \
     wmc_erc.enable="${ERC_ENABLE_VALUE}" \
     wmc_erc.mu_base="${ERC_MU_BASE}" \
     wmc_erc.mu_exp="${ERC_MU_EXP}" \
@@ -153,12 +172,24 @@ exec env \
     wmc_erc.clipping_type="${ERC_CLIPPING_TYPE}" \
     wmc_erc.clipping_method="${ERC_CLIPPING_METHOD}" \
     wmc_erc.momentum="${ERC_MOMENTUM}" \
-    trainer.project_name="${PROJECT_NAME}" \
-    trainer.experiment_name="${EXP_NAME}" \
-    trainer.default_local_dir="${CKPT_DIR}" \
-    trainer.save_freq="${SAVE_FREQ}" \
-    trainer.remove_previous_ckpt_in_save="${REMOVE_PREVIOUS_CKPT_IN_SAVE_VALUE}" \
-    trainer.max_local_ckpt_to_keep="${MAX_LOCAL_CKPT_TO_KEEP}" \
-    trainer.total_epochs="${TOTAL_EPOCHS}" \
-    trainer.nnodes=1 \
-    trainer.n_gpus_per_node="${NUM_GPUS}"
+    +wmc_erc.wmloss_add_coef="${WMLOSS_ADD_COEF}" \
+    +wmc_erc.wmloss_add_use_entropy="${WMLOSS_ADD_USE_ENTROPY}" \
+    +wmc_erc.wmloss_add_use_ema="${WMLOSS_ADD_USE_EMA}" \
+    +wmc_erc.wmloss_add_use_grouped="${WMLOSS_ADD_USE_GROUPED}" \
+    +wmc_erc.wmloss_add_use_ref_baseline="${WMLOSS_ADD_USE_REF_BASELINE}" \
+    +wmc_erc.wmloss_add_only_failed="${WMLOSS_ADD_ONLY_FAILED}" \
+    +wmc_erc.wmloss_add_coef_end="${WMLOSS_ADD_COEF_END}" \
+    +wmc_erc.wmloss_add_horizon="${WMLOSS_ADD_HORIZON}" \
+    actor_rollout_ref.actor.world_model_coeff="${WMC_COEFF}" \
+    actor_rollout_ref.actor.world_model.enable="${WM_ENABLE}" \
+    actor_rollout_ref.actor.world_model.env_predict_prompt="${WM_ENV_PREDICT_PROMPT}" \
+    actor_rollout_ref.actor.world_model.max_length="${WM_MAX_LENGTH}" \
+    actor_rollout_ref.actor.world_model.max_samples_per_trajectory="${WM_MAX_SAMPLES_PER_TRAJECTORY}" \
+    actor_rollout_ref.actor.world_model.min_env_tokens="${WM_MIN_ENV_TOKENS}" \
+    +actor_rollout_ref.actor.wm_loss_pi_dedup="${WM_LOSS_PI_DEDUP}" \
+    algorithm.world_model_coeff_ctrl.type="${WMC_TYPE}" \
+    algorithm.world_model_coeff_ctrl.start_coeff="${WMC_START_COEFF}" \
+    algorithm.world_model_coeff_ctrl.end_coeff="${WMC_END_COEFF}" \
+    algorithm.world_model_coeff_ctrl.horizon="${WMC_HORIZON}" \
+    algorithm.world_model_coeff_ctrl.power="${WMC_POWER}" \
+    algorithm.world_model_coeff_ctrl.cutoff_step="${WMC_CUTOFF_STEP}"

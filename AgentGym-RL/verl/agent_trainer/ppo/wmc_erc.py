@@ -190,6 +190,38 @@ def compute_h_action(
     return h_action_per_sample
 
 
+def compute_pi_per_turn(
+    old_log_probs: torch.Tensor,
+    response_mask: torch.Tensor,
+    turn_boundaries: List[List[Tuple[int, int]]],
+) -> List[List[torch.Tensor]]:
+    """Compute per-turn action probability p(a|s).
+
+    p(a|s)^t = exp(sum_{k in turn t} log p_k)
+    """
+    batch_size = old_log_probs.shape[0]
+    device = old_log_probs.device
+    pi_per_turn_per_sample = []
+
+    for i in range(batch_size):
+        pi_turns = []
+        for start, end in turn_boundaries[i]:
+            log_p = old_log_probs[i, start:end]
+            mask = response_mask[i, start:end]
+
+            if mask.sum() > 0:
+                # Sum log probs of action tokens in this turn
+                turn_log_prob = (log_p * mask).sum()
+                pi_t = torch.exp(turn_log_prob)
+            else:
+                pi_t = torch.tensor(1.0, device=device)
+
+            pi_turns.append(pi_t)
+        pi_per_turn_per_sample.append(pi_turns)
+
+    return pi_per_turn_per_sample
+
+
 def compute_dynamic_mask(
     s_star_per_sample: List[List[torch.Tensor]],
     h_wm_per_sample: List[List[torch.Tensor]],
@@ -295,6 +327,7 @@ def apply_wmc_erc(
     h_wm_nll = compute_h_wm(old_log_probs, response_mask, attention_mask_response, turn_boundaries)
     h_wm_entropy = compute_h_wm_entropy(entropys, response_mask, attention_mask_response, turn_boundaries)
     h_action = compute_h_action(entropys, response_mask, turn_boundaries)
+    pi_per_turn = compute_pi_per_turn(old_log_probs, response_mask, turn_boundaries)
 
     ref_entropy = batch.batch.get("ref_entropy", None)
     if ref_entropy is not None:
@@ -470,37 +503,21 @@ def apply_wmc_erc(
                 })
         else:
             # Fallback to Global or EMA
-            wmloss_add_use_ema = bool(wmc_erc_config.get("wmloss_add_use_ema", False))
-            mu_h = running_stats["h_bar"] if wmloss_add_use_ema else batch_h_bar
-            
-            factor_per_sample = []
-            all_factors = []
+            # New Formula: offset_t = alpha * (1 - pi_per_turn) * (H_wm - H_wm_EMA)
+            mu_h = running_stats["h_bar"]
+
             for i in range(batch_size):
-                sample_factors = []
                 if not traj_failed[i]:
-                    factor_per_sample.append(sample_factors)
                     continue
                 for t in range(len(target_h[i])):
                     h_val = target_h[i][t]
-                    factor_t = torch.clamp(h_val - mu_h, min=0.0)
-                    sample_factors.append(factor_t)
-                    all_factors.append(factor_t)
-                factor_per_sample.append(sample_factors)
-                
-            if all_factors:
-                all_factors_tensor = torch.stack(all_factors)
-                mu_fac = all_factors_tensor.mean()
-                if dist.is_available() and dist.is_initialized():
-                    dist.all_reduce(mu_fac, op=dist.ReduceOp.AVG)
-                
-                for i in range(batch_size):
-                    if not traj_failed[i]:
-                        continue
-                    for t in range(len(factor_per_sample[i])):
-                        offset_t = wmloss_add_coef * (factor_per_sample[i][t] - mu_fac)
-                        start, end = turn_boundaries[i][t]
-                        advantages[i, start:end] += offset_t
-                        all_offsets.append(offset_t.item())
+                    pi_t = pi_per_turn[i][t]
+
+                    offset_t = wmloss_add_coef * (1.0 - pi_t) * (h_val - mu_h)
+
+                    start, end = turn_boundaries[i][t]
+                    advantages[i, start:end] += offset_t
+                    all_offsets.append(offset_t.item())
 
         if all_offsets:
             batch.batch["advantages"] = advantages

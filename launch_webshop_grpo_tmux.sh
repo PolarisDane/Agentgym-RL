@@ -3,76 +3,66 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ENV_PORT="${ENV_PORT:-8013}"
-ENV_ADDR="http://127.0.0.1:${ENV_PORT}"
-CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-4,5,6,7}"
-MODEL_PATH="${MODEL_PATH:-${ROOT}/models/Qwen2.5-3B-Instruct}"
+BASE_PORT="${BASE_PORT:-36001}"
+CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
+MODEL_PATH="${MODEL_PATH:-/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/ziyu/.cache/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28}"
 WANDB_MODE="${WANDB_MODE:-offline}"
-WANDB_ANONYMOUS="${WANDB_ANONYMOUS:-never}"
 PROJECT_NAME="${PROJECT_NAME:-agentgym-webshop}"
-ROLLOUT_N="${ROLLOUT_N:-8}"
-TOTAL_EPOCHS="${TOTAL_EPOCHS:-2}"
-SAVE_FREQ="${SAVE_FREQ:-200}"
-ENABLE_WMC="${ENABLE_WMC:-0}"
-WMC_COEFF="${WMC_COEFF:-1e-4}"
-ENABLE_ERC="${ENABLE_ERC:-0}"
-ERC_MU_BASE="${ERC_MU_BASE:-1.0}"
-ERC_MU_EXP="${ERC_MU_EXP:-2.0}"
-ERC_ETA_WM="${ERC_ETA_WM:-3.0}"
-ERC_LAMBDA_WM="${ERC_LAMBDA_WM:-1.0}"
-ERC_CLIPPING_TYPE="${ERC_CLIPPING_TYPE:-global}"
-ERC_CLIPPING_METHOD="${ERC_CLIPPING_METHOD:-mask}"
-ERC_MOMENTUM="${ERC_MOMENTUM:-0.9}"
-REMOVE_PREVIOUS_CKPT_IN_SAVE="${REMOVE_PREVIOUS_CKPT_IN_SAVE:-0}"
-MAX_LOCAL_CKPT_TO_KEEP="${MAX_LOCAL_CKPT_TO_KEEP:-10}"
-BASE_MODEL_NAME="$(basename "${MODEL_PATH:-${ROOT}/models/Qwen2.5-3B-Instruct}")"
-RUN_TS="$(date -u +%Y%m%d_%H%M%S)"
-EXP_NAME="${EXP_NAME:-webshop_grpo_${BASE_MODEL_NAME}_${RUN_TS}}"
 
-ENV_SESSION="${ENV_SESSION:-webshop_env_${ENV_PORT}_${RUN_TS}}"
-TRAIN_SESSION="${TRAIN_SESSION:-webshop_grpo_${RUN_TS}}"
-ENV_LOG="${ROOT}/runlogs/${ENV_SESSION}.log"
+# Calculate number of envs based on GPUs
+IFS=',' read -r -a GPU_ARRAY <<< "${CUDA_VISIBLE_DEVICES}"
+NUM_ENVS="${#GPU_ARRAY[@]}"
+
+export HF_HUB_OFFLINE=1
+export WANDB_MODE=offline
+
+RUN_TS="$(date -u +%Y%m%d_%H%M%S)"
+EXP_NAME="${EXP_NAME:-webshop_grpo_qwen2.5_3b_add_${RUN_TS}}"
+
+ENV_SESSION="webshop_env_cluster_${BASE_PORT}"
+TRAIN_SESSION="webshop_grpo_train"
 TRAIN_LOG="${ROOT}/runlogs/${EXP_NAME}/train.log"
 
 mkdir -p "${ROOT}/runlogs/${EXP_NAME}"
 
-python3 "${ROOT}/scripts/prepare_webshop_grpo_splits.py"
-
 if tmux has-session -t "${ENV_SESSION}" 2>/dev/null; then
-  echo "tmux session already exists: ${ENV_SESSION}"
-  exit 1
+  tmux kill-session -t "${ENV_SESSION}"
 fi
 if tmux has-session -t "${TRAIN_SESSION}" 2>/dev/null; then
-  echo "tmux session already exists: ${TRAIN_SESSION}"
-  exit 1
+  tmux kill-session -t "${TRAIN_SESSION}"
 fi
 
+echo "Starting ${NUM_ENVS} WebShop Environment Services starting at port ${BASE_PORT}..."
 tmux new-session -d -s "${ENV_SESSION}" \
-  "cd ${ROOT} && HOST=127.0.0.1 PORT=${ENV_PORT} LOG_PATH=${ENV_LOG} bash ${ROOT}/scripts/run_webshop_env_service.sh"
+  "cd ${ROOT} && NUM_ENVS=${NUM_ENVS} BASE_PORT=${BASE_PORT} bash ${ROOT}/scripts/run_webshop_env_service.sh"
 
-for _ in $(seq 1 120); do
-  if curl --noproxy '*' -sf "${ENV_ADDR}/" >/dev/null; then
-    break
+echo "Waiting for services to become healthy..."
+for i in $(seq 0 $((NUM_ENVS - 1))); do
+  PORT=$((BASE_PORT + i))
+  ADDR="http://127.0.0.1:${PORT}"
+  echo "Checking ${ADDR}..."
+  for _ in $(seq 1 60); do
+    if curl --noproxy '*' -sf "${ADDR}/" >/dev/null; then
+      echo "Port ${PORT} is healthy."
+      break
+    fi
+    sleep 2
+  done
+  if ! curl --noproxy '*' -sf "${ADDR}/" >/dev/null; then
+    echo "WebShop service on port ${PORT} failed to start."
+    exit 1
   fi
-  sleep 2
 done
 
-if ! curl --noproxy '*' -sf "${ENV_ADDR}/" >/dev/null; then
-  echo "WebShop service did not become healthy on ${ENV_ADDR}"
-  exit 1
-fi
-
-WARMUP_ID="$(curl --noproxy '*' --max-time 1800 -sS -X POST "${ENV_ADDR}/create")"
-curl --noproxy '*' -sS -X POST "${ENV_ADDR}/close" \
-  -H 'Content-Type: application/json' \
-  -d "{\"env_idx\": ${WARMUP_ID}}" >/dev/null || true
-
+echo "Starting GRPO Training..."
 tmux new-session -d -s "${TRAIN_SESSION}" \
-  "cd ${ROOT} && CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} ENV_ADDR=${ENV_ADDR} MODEL_PATH=${MODEL_PATH} WANDB_MODE=${WANDB_MODE} WANDB_ANONYMOUS=${WANDB_ANONYMOUS} PROJECT_NAME=${PROJECT_NAME} ROLLOUT_N=${ROLLOUT_N} TOTAL_EPOCHS=${TOTAL_EPOCHS} SAVE_FREQ=${SAVE_FREQ} ENABLE_WMC=${ENABLE_WMC} WMC_COEFF=${WMC_COEFF} ENABLE_ERC=${ENABLE_ERC} ERC_MU_BASE=${ERC_MU_BASE} ERC_MU_EXP=${ERC_MU_EXP} ERC_ETA_WM=${ERC_ETA_WM} ERC_LAMBDA_WM=${ERC_LAMBDA_WM} ERC_CLIPPING_TYPE=${ERC_CLIPPING_TYPE} ERC_CLIPPING_METHOD=${ERC_CLIPPING_METHOD} ERC_MOMENTUM=${ERC_MOMENTUM} REMOVE_PREVIOUS_CKPT_IN_SAVE=${REMOVE_PREVIOUS_CKPT_IN_SAVE} MAX_LOCAL_CKPT_TO_KEEP=${MAX_LOCAL_CKPT_TO_KEEP} EXP_NAME=${EXP_NAME} LOG_PATH=${TRAIN_LOG} bash ${ROOT}/scripts/run_webshop_grpo_train.sh"
+  "cd ${ROOT} && CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} BASE_PORT=${BASE_PORT} MODEL_PATH=${MODEL_PATH} WANDB_MODE=${WANDB_MODE} PROJECT_NAME=${PROJECT_NAME} EXP_NAME=${EXP_NAME} LOG_PATH=${TRAIN_LOG} bash ${ROOT}/scripts/run_webshop_grpo_train.sh"
 
-echo "Environment tmux session: ${ENV_SESSION}"
-echo "Training tmux session: ${TRAIN_SESSION}"
-echo "WebShop service: ${ENV_ADDR}"
-echo "Environment log: ${ENV_LOG}"
-echo "Training log: ${TRAIN_LOG}"
-echo "Warmup env id: ${WARMUP_ID}"
+echo "--------------------------------------------------"
+echo "WebShop Training Cluster Launched!"
+echo "Number of Envs:      ${NUM_ENVS}"
+echo "Base Port:           ${BASE_PORT}"
+echo "Environment Session: ${ENV_SESSION}"
+echo "Training Session:    ${TRAIN_SESSION}"
+echo "Training Log:        ${TRAIN_LOG}"
+echo "--------------------------------------------------"
