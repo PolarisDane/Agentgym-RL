@@ -316,15 +316,15 @@ class DataParallelPPOActor(BasePPOActor):
                 # The recommended path is the separate ``update_world_model``
                 # pass driven by ``ray_trainer.fit`` on a freshly re-assembled
                 # chat-template batch.
-                if world_model_coeff > 0 and 'observation_mask' in data.keys():
-                    explicit_observation_mask = data['observation_mask']
+                if world_model_coeff > 0:  # IN-PLACE WM SFT FORCED-ON (chat template disabled)
+                    explicit_observation_mask = data.get('observation_mask', None)
                     
                     if self.config.get('wm_loss_pi_dedup', False):
                         obs_mask = compute_observation_mask(
                             attention_mask=data['attention_mask'],
                             response_mask=response_mask,
                             observation_mask=explicit_observation_mask)
-                        
+
                         if obs_mask.any().item():
                             olp = data['old_log_probs'].detach()
                             t_ids = compute_turn_ids(response_mask)
@@ -332,17 +332,17 @@ class DataParallelPPOActor(BasePPOActor):
                             B = response_mask.size(0)
                             dt = log_prob.dtype
                             rm_f = response_mask.to(dt)
-                            
+
                             log_pi_sum = torch.zeros(B, n_total, device=olp.device, dtype=dt)
                             n_act = torch.zeros_like(log_pi_sum)
                             log_pi_sum.scatter_add_(1, t_ids, olp.to(dt) * rm_f)
                             n_act.scatter_add_(1, t_ids, rm_f)
-                            
+
                             log_pi_mean = log_pi_sum / n_act.clamp(min=1.0)
                             pi_per_turn = log_pi_mean.exp().clamp(0.0, 1.0)
                             w_per_turn = (1.0 - pi_per_turn)  # ∈ [0, 1]
                             w_per_token = w_per_turn.gather(1, t_ids).to(dt)
-                            
+
                             obs_mask_w = obs_mask.to(dt) * w_per_token
                             denom = obs_mask_w.sum().clamp(min=1e-6)
                             wm_sft_loss = -(log_prob * obs_mask_w).sum() / denom

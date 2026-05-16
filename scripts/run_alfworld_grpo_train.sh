@@ -5,12 +5,11 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TRAIN_CODE_DIR="${ROOT}/AgentGym-RL"
 CONDA_SH="${CONDA_SH:-/opt/conda/etc/profile.d/conda.sh}"
-TRAIN_ENV="${TRAIN_ENV:-/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/cy/conda_envs/agentgym-rl}"
+TRAIN_ENV="${TRAIN_ENV:-/mnt/tidal-alsh-share2/usr/wangshanyong/conda_envs/agentgym-rl-h20}"
 MODEL_PATH="${MODEL_PATH:-/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/ziyu/.cache/huggingface/hub/models--Qwen--Qwen2.5-3B-Instruct}"
 TASK_NAME="alfworld"
 
 export HF_HUB_OFFLINE=1
-export WANDB_MODE=offline
 
 ENV_ADDR_HOST="${ENV_ADDR_HOST:-127.0.0.1}"
 BASE_PORT="${BASE_PORT:-36001}"
@@ -32,14 +31,15 @@ done
 ENV_ADDR="${ENV_ADDR:-${ENV_ADDR_LIST}}"
 echo "Using ENV_ADDR: ${ENV_ADDR}"
 
-WANDB_MODE="${WANDB_MODE:-offline}"
+WANDB_MODE="${WANDB_MODE:-online}"
+WANDB_API_KEY="${WANDB_API_KEY:-}"
 PROJECT_NAME="${PROJECT_NAME:-agentgym-alfworld}"
 
 KL_COEF="${KL_COEF:-0.001}"
 ENTROPY_COEF="${ENTROPY_COEF:-0.001}"
 POLICY_LR="${POLICY_LR:-1e-6}"
 ROLLOUT_N="${ROLLOUT_N:-8}"
-TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:8}"
+TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-16}"
 PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-8}"
 PPO_MICRO_BATCH_SIZE_PER_GPU="${PPO_MICRO_BATCH_SIZE_PER_GPU:-1}"
 PPO_EPOCHS="${PPO_EPOCHS:-1}"
@@ -59,7 +59,7 @@ ERC_ETA_WM="${ERC_ETA_WM:-2.0}"
 ERC_LAMBDA_WM="${ERC_LAMBDA_WM:-1.0}"
 ERC_CLIPPING_TYPE="${ERC_CLIPPING_TYPE:-global}"
 ERC_CLIPPING_METHOD="${ERC_CLIPPING_METHOD:-add}"
-ERC_MOMENTUM="${ERC_MOMENTUM:-0.5}"
+ERC_MOMENTUM="${ERC_MOMENTUM:-0.8}"
 WMLOSS_ADD_COEF="${WMLOSS_ADD_COEF:-0.5}"
 WMLOSS_ADD_COEF_END="${WMLOSS_ADD_COEF_END:-0}"
 WMLOSS_ADD_HORIZON="${WMLOSS_ADD_HORIZON:-0}"
@@ -68,6 +68,8 @@ WMLOSS_ADD_USE_EMA="${WMLOSS_ADD_USE_EMA:-False}"
 WMLOSS_ADD_USE_GROUPED="${WMLOSS_ADD_USE_GROUPED:-False}"
 WMLOSS_ADD_USE_REF_BASELINE="${WMLOSS_ADD_USE_REF_BASELINE:-False}"
 WMLOSS_ADD_ONLY_FAILED="${WMLOSS_ADD_ONLY_FAILED:-True}"
+WMLOSS_ADD_USE_PI_WEIGHT="${WMLOSS_ADD_USE_PI_WEIGHT:-True}"
+WMLOSS_ADD_BASELINE="${WMLOSS_ADD_BASELINE:-ema}"
 
 ERC_ENABLE_VALUE="False"
 if [[ "${ENABLE_ERC}" == "1" ]]; then
@@ -114,7 +116,14 @@ export NO_PROXY="${NO_PROXY:-127.0.0.1,localhost}"
 export no_proxy="${no_proxy:-127.0.0.1,localhost}"
 
 cd "${TRAIN_CODE_DIR}"
-exec env \
+
+# CPU affinity wrapper (limits how many CPUs Ray sees → avoids prestart worker storm)
+TASKSET_PREFIX=""
+if [[ -n "${CPU_AFFINITY:-}" ]]; then
+  TASKSET_PREFIX="taskset -c ${CPU_AFFINITY}"
+fi
+
+exec ${TASKSET_PREFIX} env \
   -u http_proxy -u https_proxy -u all_proxy \
   -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
   NO_PROXY="${NO_PROXY}" \
@@ -126,6 +135,8 @@ exec env \
   HYDRA_FULL_ERROR=1 \
   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   WANDB_MODE="${WANDB_MODE}" \
+  WANDB_API_KEY="${WANDB_API_KEY}" \
+  RAY_TMPDIR="${RAY_TMPDIR:-/tmp/ray}" \
   python -m verl.agent_trainer.main_ppo \
     algorithm.adv_estimator=grpo \
     algorithm.rounds_ctrl.type=fixed \
@@ -180,6 +191,8 @@ exec env \
     +wmc_erc.wmloss_add_use_grouped="${WMLOSS_ADD_USE_GROUPED}" \
     +wmc_erc.wmloss_add_use_ref_baseline="${WMLOSS_ADD_USE_REF_BASELINE}" \
     +wmc_erc.wmloss_add_only_failed="${WMLOSS_ADD_ONLY_FAILED}" \
+    +wmc_erc.wmloss_add_use_pi_weight="${WMLOSS_ADD_USE_PI_WEIGHT}" \
+    +wmc_erc.wmloss_add_baseline="${WMLOSS_ADD_BASELINE}" \
     +wmc_erc.wmloss_add_coef_end="${WMLOSS_ADD_COEF_END}" \
     +wmc_erc.wmloss_add_horizon="${WMLOSS_ADD_HORIZON}" \
     actor_rollout_ref.actor.world_model_coeff="${WMC_COEFF}" \

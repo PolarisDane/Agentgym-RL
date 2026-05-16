@@ -190,6 +190,38 @@ def compute_h_action(
     return h_action_per_sample
 
 
+def compute_pi_per_turn(
+    old_log_probs: torch.Tensor,
+    response_mask: torch.Tensor,
+    turn_boundaries: List[List[Tuple[int, int]]],
+) -> List[List[torch.Tensor]]:
+    """Compute per-turn action probability p(a|s).
+
+    p(a|s)^t = exp(sum_{k in turn t} log p_k)
+    """
+    batch_size = old_log_probs.shape[0]
+    device = old_log_probs.device
+    pi_per_turn_per_sample = []
+
+    for i in range(batch_size):
+        pi_turns = []
+        for start, end in turn_boundaries[i]:
+            log_p = old_log_probs[i, start:end]
+            mask = response_mask[i, start:end]
+
+            if mask.sum() > 0:
+                # Sum log probs of action tokens in this turn
+                turn_log_prob = (log_p * mask).sum()
+                pi_t = torch.exp(turn_log_prob)
+            else:
+                pi_t = torch.tensor(1.0, device=device)
+
+            pi_turns.append(pi_t)
+        pi_per_turn_per_sample.append(pi_turns)
+
+    return pi_per_turn_per_sample
+
+
 def compute_dynamic_mask(
     s_star_per_sample: List[List[torch.Tensor]],
     h_wm_per_sample: List[List[torch.Tensor]],
@@ -295,6 +327,7 @@ def apply_wmc_erc(
     h_wm_nll = compute_h_wm(old_log_probs, response_mask, attention_mask_response, turn_boundaries)
     h_wm_entropy = compute_h_wm_entropy(entropys, response_mask, attention_mask_response, turn_boundaries)
     h_action = compute_h_action(entropys, response_mask, turn_boundaries)
+    pi_per_turn = compute_pi_per_turn(old_log_probs, response_mask, turn_boundaries)
 
     ref_entropy = batch.batch.get("ref_entropy", None)
     if ref_entropy is not None:
@@ -309,8 +342,28 @@ def apply_wmc_erc(
         target_h = h_wm_entropy
     else:
         target_h = h_wm_nll
-    
+
     all_h = [h.item() for turns in target_h for h in turns]
+
+    # ===== Log stats for both H_wm (entropy) and L_wm (NLL) regardless of which is target =====
+    all_h_entropy_list = [h.item() for turns in h_wm_entropy for h in turns]
+    all_h_nll_list = [h.item() for turns in h_wm_nll for h in turns]
+
+    def _stats(values):
+        if not values:
+            return 0.0, 0.0, 0.0
+        t = torch.tensor(values, device=advantages.device, dtype=torch.float32)
+        mean_t = t.mean()
+        std_t = t.std(correction=0) if len(values) > 1 else torch.tensor(0.0, device=advantages.device)
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(mean_t, op=dist.ReduceOp.AVG)
+            dist.all_reduce(std_t, op=dist.ReduceOp.AVG)
+        mean = mean_t.item()
+        std = std_t.item()
+        return mean, std, std ** 2
+
+    h_wm_entropy_mean, h_wm_entropy_std, h_wm_entropy_var = _stats(all_h_entropy_list)
+    h_wm_loss_mean, h_wm_loss_std, h_wm_loss_var = _stats(all_h_nll_list)
 
     if not all_s:
         return batch, {}
@@ -470,37 +523,31 @@ def apply_wmc_erc(
                 })
         else:
             # Fallback to Global or EMA
-            wmloss_add_use_ema = bool(wmc_erc_config.get("wmloss_add_use_ema", False))
-            mu_h = running_stats["h_bar"] if wmloss_add_use_ema else batch_h_bar
-            
-            factor_per_sample = []
-            all_factors = []
+            # General formula:
+            #   offset_t = α * weight * (H_wm[t] - μ_H)
+            # weight = (1 - π_t) if wmloss_add_use_pi_weight else 1.0
+            # μ_H    = batch_h_bar if wmloss_add_baseline == "batch_mean" else running_stats["h_bar"] (EMA)
+            # H_wm[t] = target_h, which is h_wm_entropy or h_wm_nll based on wmloss_add_use_entropy
+            use_pi_weight = bool(wmc_erc_config.get("wmloss_add_use_pi_weight", True))
+            baseline_type = str(wmc_erc_config.get("wmloss_add_baseline", "ema")).lower()
+            if baseline_type == "batch_mean":
+                mu_h = batch_h_bar
+            else:
+                mu_h = running_stats["h_bar"]
+
             for i in range(batch_size):
-                sample_factors = []
                 if not traj_failed[i]:
-                    factor_per_sample.append(sample_factors)
                     continue
                 for t in range(len(target_h[i])):
                     h_val = target_h[i][t]
-                    factor_t = torch.clamp(h_val - mu_h, min=0.0)
-                    sample_factors.append(factor_t)
-                    all_factors.append(factor_t)
-                factor_per_sample.append(sample_factors)
-                
-            if all_factors:
-                all_factors_tensor = torch.stack(all_factors)
-                mu_fac = all_factors_tensor.mean()
-                if dist.is_available() and dist.is_initialized():
-                    dist.all_reduce(mu_fac, op=dist.ReduceOp.AVG)
-                
-                for i in range(batch_size):
-                    if not traj_failed[i]:
-                        continue
-                    for t in range(len(factor_per_sample[i])):
-                        offset_t = wmloss_add_coef * (factor_per_sample[i][t] - mu_fac)
-                        start, end = turn_boundaries[i][t]
-                        advantages[i, start:end] += offset_t
-                        all_offsets.append(offset_t.item())
+                    pi_t = pi_per_turn[i][t]
+
+                    weight = (1.0 - pi_t) if use_pi_weight else 1.0
+                    offset_t = wmloss_add_coef * weight * (h_val - mu_h)
+
+                    start, end = turn_boundaries[i][t]
+                    advantages[i, start:end] += offset_t
+                    all_offsets.append(offset_t.item())
 
         if all_offsets:
             batch.batch["advantages"] = advantages
@@ -592,6 +639,14 @@ def apply_wmc_erc(
         "wmc_erc/num_exploration_violated": num_exploration_violated,
         "wmc_erc/total_turns": len(all_m) if clipping_method != "add" else len(all_h),
         "wmc_erc/wm_nll": wm_nll,
+        # World model entropy stats (across all turns in batch)
+        "wmc_erc/h_wm_entropy_mean": float(h_wm_entropy_mean),
+        "wmc_erc/h_wm_entropy_std": float(h_wm_entropy_std),
+        "wmc_erc/h_wm_entropy_var": float(h_wm_entropy_var),
+        # World model loss (NLL) stats (across all turns in batch)
+        "wmc_erc/wm_loss_mean": float(h_wm_loss_mean),
+        "wmc_erc/wm_loss_std": float(h_wm_loss_std),
+        "wmc_erc/wm_loss_var": float(h_wm_loss_var),
     }
     metrics.update(add_metrics)
 

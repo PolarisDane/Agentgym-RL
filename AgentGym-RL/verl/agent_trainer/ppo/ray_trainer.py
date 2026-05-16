@@ -999,6 +999,14 @@ class RayPPOTrainer(object):
                         batch = batch.union(old_log_prob)
                         batch.meta_info['return_entropy'] = False
 
+                    # 在 batch dict 进入 update 之前
+                    batch.batch['old_log_probs'] = torch.nan_to_num(
+                        batch.batch['old_log_probs'],
+                        nan=-10.0,
+                        posinf=0.0,      # log prob 不应该 > 0，但兜底
+                        neginf=-10.0,    # 这是核心防护
+                    )
+
                     if self.use_reference_policy:
                         # compute reference log_prob
                         with _timer('ref', timing_raw):
@@ -1059,7 +1067,7 @@ class RayPPOTrainer(object):
 
                         # Optional world-model SFT update on env-prediction data
                         # re-assembled with chat template from the rollout.
-                        if float(self.config.actor_rollout_ref.actor.get('world_model_coeff', 0.0)) > 0:
+                        if False:  # CHAT-TEMPLATE WM SFT DISABLED
                             wm_data = self._build_world_model_sft_dataproto(batch)
                             if wm_data is not None and len(wm_data) > 0:
                                 # DP dispatch requires divisibility by world_size.

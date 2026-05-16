@@ -28,7 +28,16 @@ def main(config):
 def run_ppo(config):
     if not ray.is_initialized():
         # this is for local ray cluster
-        ray.init(runtime_env={'env_vars': {'TOKENIZERS_PARALLELISM': 'true', 'NCCL_DEBUG': 'WARN'}})
+        # num_cpus limited via RAY_NUM_CPUS env var (default: 2x n_gpus_per_node) to avoid
+        # Ray prestart-worker fork-bomb OOM in containers with many CPUs (e.g. 170 CPUs)
+        import os
+        num_cpus_env = os.environ.get('RAY_NUM_CPUS')
+        n_gpus = int(config.trainer.get('n_gpus_per_node', 1))
+        ray_num_cpus = int(num_cpus_env) if num_cpus_env else max(8, 2 * n_gpus)
+        ray.init(
+            num_cpus=ray_num_cpus,
+            runtime_env={'env_vars': {'TOKENIZERS_PARALLELISM': 'true', 'NCCL_DEBUG': 'WARN'}},
+        )
 
     ray.get(main_task.remote(config))
 
