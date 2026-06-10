@@ -33,7 +33,13 @@ from verl.single_controller.base import Worker
 from verl.single_controller.ray import RayResourcePool, RayWorkerGroup, RayClassWithInitArgs
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.agent_trainer.ppo import core_algos
-from verl.agent_trainer.ppo.wmc_erc import apply_wmc_erc
+from verl.agent_trainer.ppo.wmc_erc import (
+    apply_wmc_erc,
+    apply_wmc_erc_to_reward,
+    apply_value_baseline_redistribution,
+    apply_hca_advantage,
+    apply_ref_nll_add_advantage,
+)
 from verl.agent_trainer.ppo.world_model_loss import (
     DEFAULT_WORLD_MODEL_PROMPT,
     build_world_model_sft_batch,
@@ -547,6 +553,41 @@ class RayPPOTrainer(object):
         else:
             raise NotImplementedError
 
+        # Optional GRPO state-value baseline (turn-level redistribution).
+        # When disabled (default), no state_values are computed and the
+        # advantage path is bit-for-bit identical to the original GRPO code.
+        self.use_value_baseline = bool(
+            self.config.actor_rollout_ref.actor.get('use_value_baseline', False))
+        self.value_baseline_beta = float(
+            self.config.actor_rollout_ref.actor.get('value_baseline_beta', 1.0))
+        # Linear warmup on β so the early-step noisy V doesn't pollute the
+        # GRPO advantage. β_eff = β · min(1, global_step / warmup_steps).
+        # Default 20 — covers the empirically observed noisy-V window (step
+        # 8-24 in the May-31 alfworld run).
+        self.value_baseline_beta_warmup_steps = int(
+            self.config.actor_rollout_ref.actor.get('value_baseline_beta_warmup_steps', 20))
+
+        # Hindsight Credit Assignment (HCA) — see feature.md. Hard mutex
+        # with value baseline (a duplicate assert in DataParallelPPOActor
+        # catches the worker-side too).
+        self.use_hindsight_hca = bool(
+            self.config.actor_rollout_ref.actor.get('use_hindsight_hca', False))
+        assert not (self.use_value_baseline and self.use_hindsight_hca), \
+            'USE_VALUE_BASELINE and USE_HINDSIGHT_HCA are mutually exclusive.'
+        # HCAPO (training-free generative verification) hyperparameters.
+        _a = self.config.actor_rollout_ref.actor
+        self.hca_ratio_clip_min = float(_a.get('hca_ratio_clip_min', 0.8))
+        self.hca_ratio_clip_max = float(_a.get('hca_ratio_clip_max', 1.2))
+        self.hca_temp = float(_a.get('hca_temp', 5.0))
+        self.hca_omega = float(_a.get('hca_omega', 1.0))
+        self.hca_gamma = float(_a.get('hca_gamma', 0.95))
+        self.hca_smooth_alpha = float(_a.get('hca_smooth_alpha', 0.5))
+        self.hca_z_threshold = float(_a.get('hca_z_threshold', 0.5))
+        # Score ρ on action-decision tokens only (after the delimiter), not the
+        # whole Thought+Action turn. Default OFF (= whole-turn scoring).
+        self.hca_action_only = bool(_a.get('hca_action_only', False))
+        self.hca_action_delimiter = str(_a.get('hca_action_delimiter', 'Action:'))
+
         self._validate_config()
         self._create_dataloader()
 
@@ -999,13 +1040,13 @@ class RayPPOTrainer(object):
                         batch = batch.union(old_log_prob)
                         batch.meta_info['return_entropy'] = False
 
-                    # 在 batch dict 进入 update 之前
-                    batch.batch['old_log_probs'] = torch.nan_to_num(
-                        batch.batch['old_log_probs'],
-                        nan=-10.0,
-                        posinf=0.0,      # log prob 不应该 > 0，但兜底
-                        neginf=-10.0,    # 这是核心防护
-                    )
+                    # # 在 batch dict 进入 update 之前
+                    # batch.batch['old_log_probs'] = torch.nan_to_num(
+                    #     batch.batch['old_log_probs'],
+                    #     nan=-10.0,
+                    #     posinf=0.0,      # log prob 不应该 > 0，但兜底
+                    #     neginf=-10.0,    # 这是核心防护
+                    # )
 
                     if self.use_reference_policy:
                         # compute reference log_prob
@@ -1019,10 +1060,26 @@ class RayPPOTrainer(object):
                             values = self.critic_wg.compute_values(batch)
                             batch = batch.union(values)
 
+                    # compute per-turn state values via the actor's value head
+                    if self.use_value_baseline:
+                        with _timer('state_values', timing_raw):
+                            state_values_out = self.actor_rollout_wg.compute_state_values(batch)
+                            batch = batch.union(state_values_out)
+
                     with _timer('adv', timing_raw):
                         # we combine with rule-based rm
                         reward_tensor = batch.batch['scores']
                         batch.batch['token_level_scores'] = reward_tensor
+                        if self.use_hindsight_hca:
+                            # Per-trajectory R for outcome label z and HCA
+                            # centered baseline (R − b(s_t)). Set BEFORE
+                            # GRPO advantage so it's available downstream.
+                            batch.batch['traj_return'] = reward_tensor.sum(dim=-1)
+                        if self.use_value_baseline:
+                            # Per-trajectory outcome reward R (sum over the
+                            # sparse-end placement done by the rollout). Used
+                            # as the V-head MSE target inside update_policy.
+                            batch.batch['traj_return'] = reward_tensor.sum(dim=-1)
 
                         # compute rewards. apply_kl_penalty if available
                         if not self.config.actor_rollout_ref.actor.get('use_kl_loss', False):
@@ -1033,6 +1090,31 @@ class RayPPOTrainer(object):
                         else:
                             batch.batch['token_level_rewards'] = batch.batch['token_level_scores']
 
+                        # ref_nll_add OVERRIDES every other wmc_erc path: a
+                        # direct additive shaping from the frozen ref model's
+                        # env-token NLL, applied post-advantage below.
+                        ref_nll_add = bool(self.wmc_erc_config
+                                           and self.wmc_erc_config.get('ref_nll_add', False))
+
+                        # Inject WMC-ERC curiosity bonus into rewards BEFORE
+                        # advantage normalization when wmloss_add_to_reward is
+                        # set, so GRPO's group rescaling absorbs the bonus and
+                        # the unit-variance property is preserved.
+                        if (self.wmc_erc_config
+                                and not ref_nll_add
+                                and self.wmc_erc_config.get('enable', False)
+                                and self.wmc_erc_config.get('clipping_method', 'mask') == 'add'
+                                and self.wmc_erc_config.get('wmloss_add_to_reward', False)
+                                and 'entropys' in batch.batch.keys()):
+                            batch, wmc_reward_metrics = apply_wmc_erc_to_reward(
+                                batch=batch,
+                                entropys=batch.batch['entropys'],
+                                wmc_erc_config=self.wmc_erc_config,
+                                running_stats=self.wmc_erc_running_stats,
+                                step=self.global_steps,
+                            )
+                            metrics.update(wmc_reward_metrics)
+
                         # compute advantages, executed on the driver process
                         batch = compute_advantage(batch,
                                                   adv_estimator=self.config.algorithm.adv_estimator,
@@ -1040,7 +1122,47 @@ class RayPPOTrainer(object):
                                                   lam=self.config.algorithm.lam,
                                                   num_repeat=self.config.actor_rollout_ref.rollout.n)
 
-                        if self.wmc_erc_config and self.wmc_erc_config.get('enable', False) and 'entropys' in batch.batch.keys():
+                        if self.use_value_baseline and 'state_values' in batch.batch.keys():
+                            warm = max(1, self.value_baseline_beta_warmup_steps)
+                            beta_eff = self.value_baseline_beta * min(
+                                1.0, float(self.global_steps) / warm)
+                            vb_metrics = apply_value_baseline_redistribution(
+                                data=batch, beta=beta_eff)
+                            vb_metrics['value_baseline/beta_eff'] = beta_eff
+                            metrics.update(vb_metrics)
+
+                        # HCAPO path (training-free): re-prompt the frozen
+                        # policy with the realized outcome, form per-action
+                        # hindsight Q-values, add the cross-state-normalized
+                        # micro advantage to the GRPO macro advantage in place.
+                        if self.use_hindsight_hca:
+                            with _timer('hca_h_log_probs', timing_raw):
+                                h_lp_out = self.actor_rollout_wg.compute_hindsight_log_probs(batch)
+                                batch = batch.union(h_lp_out)
+                            hca_metrics = apply_hca_advantage(
+                                data=batch,
+                                ratio_clip_min=self.hca_ratio_clip_min,
+                                ratio_clip_max=self.hca_ratio_clip_max,
+                                temp=self.hca_temp,
+                                omega=self.hca_omega,
+                                gamma=self.hca_gamma,
+                                smooth_alpha=self.hca_smooth_alpha,
+                                success_threshold=self.hca_z_threshold,
+                                action_only=self.hca_action_only,
+                                tokenizer=self.tokenizer,
+                                action_delimiter=self.hca_action_delimiter,
+                            )
+                            batch.batch.pop('h_log_probs', None)
+                            metrics.update(hca_metrics)
+
+                        if ref_nll_add:
+                            # Override: coef * ref-model env NLL added to
+                            # advantage per turn. Independent of wmc_erc.enable
+                            # and clipping_method; needs no entropys.
+                            batch, ref_nll_metrics = apply_ref_nll_add_advantage(
+                                batch=batch, wmc_erc_config=self.wmc_erc_config)
+                            metrics.update(ref_nll_metrics)
+                        elif self.wmc_erc_config and self.wmc_erc_config.get('enable', False) and 'entropys' in batch.batch.keys():
                             batch, wmc_metrics = apply_wmc_erc(batch=batch,
                                                                entropys=batch.batch['entropys'],
                                                                wmc_erc_config=self.wmc_erc_config,
@@ -1067,7 +1189,7 @@ class RayPPOTrainer(object):
 
                         # Optional world-model SFT update on env-prediction data
                         # re-assembled with chat template from the rollout.
-                        if float(self.config.actor_rollout_ref.actor.get('world_model_coeff', 0.0)) > 0:
+                        if False:
                             wm_data = self._build_world_model_sft_dataproto(batch)
                             if wm_data is not None and len(wm_data) > 0:
                                 # DP dispatch requires divisibility by world_size.

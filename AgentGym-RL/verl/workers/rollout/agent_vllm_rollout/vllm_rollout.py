@@ -158,12 +158,20 @@ class vLLMRollout(BaseRollout):
                 input_ids = _pre_process_inputs(self.pad_token_id, prompts.batch['input_ids'][i])
                 attention_mask = _pre_process_inputs(0, prompts.batch['attention_mask'][i])
                 position_ids = compute_position_id_with_mask(torch.tensor(attention_mask)).tolist()
+                item_id_str = prompts.non_tensor_batch["item_id"][i]
+                try:
+                    task_name = item_id_str.split("_")[0]
+                    item_id = int(item_id_str.split("_")[-1])
+                except (ValueError, IndexError):
+                    task_name = self.agentgym_config.task_name
+                    item_id = i # Fallback to batch index if we can't parse it (might still be wrong but better than crash)
+
                 handler = RolloutHandler(
                     messages=[
                         Message(role=prompt["role"], content=prompt["content"]) for prompt in raw_prompt
                     ],
-                    task_name=prompts.non_tensor_batch["item_id"][i].split("_")[0],
-                    item_id=int(prompts.non_tensor_batch["item_id"][i].split("_")[-1]),
+                    task_name=task_name,
+                    item_id=item_id,
                     score=0,
                     done=False,
                     input_ids=list(input_ids),
@@ -188,6 +196,13 @@ class vLLMRollout(BaseRollout):
                 handler_list.append(handler)
         return handler_list
 
+    def _shape_task_reward(self, task_score: float, task_done: bool, task_name: str = "") -> float:
+        if str(task_name).lower() == "sciworld":
+            return 1.0 if bool(task_done) and float(task_score) >= 100.0 else 0.0
+        # elif str(task_name).lower() == "webshop":
+        #     return 1.0 if bool(task_done) and float(task_score) >= 1.0 else 0.0
+        else:
+            return task_score
 
     @torch.no_grad()
     def generate_sequences(self, prompts: DataProto, **kwargs) -> DataProto:
@@ -294,7 +309,11 @@ class vLLMRollout(BaseRollout):
             response_position_ids.append(torch.tensor(rollout_handler.response_position_ids, dtype=torch.int, device=cur_device))
             response_loss_mask.append(torch.tensor(rollout_handler.response_loss_mask, dtype=torch.int, device=cur_device))
             response_observation_mask.append(torch.tensor(rollout_handler.response_observation_mask, dtype=torch.int, device=cur_device))
-            scores.append(rollout_handler.score)
+            scores.append(self._shape_task_reward(
+                task_score=rollout_handler.score,
+                task_done=rollout_handler.done,
+                task_name=rollout_handler.task_name,
+            ))
             messages.append(rollout_handler.messages)
         
         # pad to length

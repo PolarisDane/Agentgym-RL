@@ -6,7 +6,7 @@ import glob
 # Configuration
 SEARCH_DIR = "."
 WANDB_API_KEY = "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"
-SYNC_INTERVAL = 300  # 5 minutes
+SYNC_INTERVAL = 120  # 5 minutes
 ACTIVE_THRESHOLD = 600  # 10 minutes (Considered active if modified within this time)
 
 def get_all_offline_runs():

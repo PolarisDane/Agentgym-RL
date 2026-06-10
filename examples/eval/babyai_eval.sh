@@ -23,7 +23,7 @@ python model_merger.py \
     --local_dir ${ckpt_path}
 
 HYDRA_FULL_ERROR=1 python3 -m verl.agent_trainer.main_generation  \
-    data.path=AgentEval/${task_name} \
+    data.path=AgentItemId/test \
     data.max_prompt_length=512 \
     data.max_response_length=8192 \
     data.n_samples=${sample_num} \

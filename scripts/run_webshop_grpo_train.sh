@@ -13,7 +13,7 @@ export HF_HUB_OFFLINE=1
 export WANDB_MODE=offline
 
 ENV_ADDR_HOST="${ENV_ADDR_HOST:-127.0.0.1}"
-BASE_PORT="${BASE_PORT:-36001}"
+BASE_PORT="${BASE_PORT:-36101}"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 IFS=',' read -r -a GPU_ARRAY <<< "${CUDA_VISIBLE_DEVICES}"
 NUM_GPUS="${#GPU_ARRAY[@]}"
@@ -43,14 +43,14 @@ TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-16}"
 PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-8}"
 PPO_MICRO_BATCH_SIZE_PER_GPU="${PPO_MICRO_BATCH_SIZE_PER_GPU:-1}"
 PPO_EPOCHS="${PPO_EPOCHS:-1}"
-TOTAL_EPOCHS="${TOTAL_EPOCHS:-2}"
+TOTAL_EPOCHS="${TOTAL_EPOCHS:-5}"
 MAX_ROUNDS="${MAX_ROUNDS:-15}"
-MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-768}"
-MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-2048}"
-MAX_MODEL_LEN="${MAX_MODEL_LEN:-4096}"
-MAX_TOKENS_PER_TURN="${MAX_TOKENS_PER_TURN:-256}"
+MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-2048}"
+MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-8192}"
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-16384}"
+MAX_TOKENS_PER_TURN="${MAX_TOKENS_PER_TURN:-512}"
 ROLLOUT_GPU_MEMORY_UTILIZATION="${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.80}"
-SAVE_FREQ="${SAVE_FREQ:-50}"
+SAVE_FREQ="${SAVE_FREQ:-25}"
 
 ENABLE_ERC="${ENABLE_ERC:-0}"
 ERC_MU_BASE="${ERC_MU_BASE:-1.0}"
@@ -60,19 +60,79 @@ ERC_LAMBDA_WM="${ERC_LAMBDA_WM:-1.0}"
 ERC_CLIPPING_TYPE="${ERC_CLIPPING_TYPE:-global}"
 ERC_CLIPPING_METHOD="${ERC_CLIPPING_METHOD:-add}"
 ERC_MOMENTUM="${ERC_MOMENTUM:-0.5}"
+# Uncertainty-scaling (set ERC_CLIPPING_METHOD=uncertainty_scale to use):
+# shrink advantage on turns with high next-obs env entropy (model unsure
+# what its action causes) to prevent action-entropy collapse there.
+UNCERTAINTY_SCALE_KAPPA="${UNCERTAINTY_SCALE_KAPPA:-1.0}"
+UNCERTAINTY_SCALE_MIN="${UNCERTAINTY_SCALE_MIN:-0.5}"
+UNCERTAINTY_SCALE_RENORMALIZE="${UNCERTAINTY_SCALE_RENORMALIZE:-True}"
 WMLOSS_ADD_COEF="${WMLOSS_ADD_COEF:-0.2}"
 WMLOSS_ADD_COEF_END="${WMLOSS_ADD_COEF_END:-0}"
 WMLOSS_ADD_HORIZON="${WMLOSS_ADD_HORIZON:-0}"
 WMLOSS_ADD_USE_ENTROPY="${WMLOSS_ADD_USE_ENTROPY:-True}"
 WMLOSS_ADD_USE_EMA="${WMLOSS_ADD_USE_EMA:-False}"
 WMLOSS_ADD_USE_GROUPED="${WMLOSS_ADD_USE_GROUPED:-False}"
-WMLOSS_ADD_USE_REF_BASELINE="${WMLOSS_ADD_USE_REF_BASELINE:-True}"
-WMLOSS_ADD_ONLY_FAILED="${WMLOSS_ADD_ONLY_FAILED:-True}"
+WMLOSS_ADD_USE_REF_BASELINE="${WMLOSS_ADD_USE_REF_BASELINE:-False}"
+WMLOSS_ADD_ONLY_FAILED="${WMLOSS_ADD_ONLY_FAILED:-False}"
+WMLOSS_ADD_TO_REWARD="${WMLOSS_ADD_TO_REWARD:-False}"
+# ref_nll_add: OVERRIDES all other wmc_erc paths. Adds REF_NLL_COEF *
+# (frozen initial ref model env-token NLL) directly to advantage per turn.
+REF_NLL_ADD="${REF_NLL_ADD:-False}"
+REF_NLL_COEF="${REF_NLL_COEF:-0.1}"
+# Epistemic advantage scaling (set ERC_CLIPPING_METHOD=epistemic_scale to use).
+EPISTEMIC_USE_REF="${EPISTEMIC_USE_REF:-False}"
+EPISTEMIC_BASE="${EPISTEMIC_BASE:-1.0}"
+EPISTEMIC_S_MAX="${EPISTEMIC_S_MAX:-3.0}"
+EPISTEMIC_SHAPE="${EPISTEMIC_SHAPE:-sqrt}"
+EPISTEMIC_BASE_NEG="${EPISTEMIC_BASE_NEG:-${EPISTEMIC_BASE}}"
+EPISTEMIC_PRE_ADD_COEF="${EPISTEMIC_PRE_ADD_COEF:-0.0}"
+# Design A: pure non-negative additive intrinsic bonus on advantage.
+#   A_t += EPI_INTRINSIC_COEF * min(U_t, EPI_INTRINSIC_CAP), U=max(0, NLL-H).
+# Use with ERC_CLIPPING_METHOD=epi_intrinsic_add. No recentering, no per-turn
+# redistribution -- just a calibration-gap intrinsic reward at the advantage
+# layer (noisy-TV-robust ICM variant), parallel to WM-SFT.
+EPI_INTRINSIC_COEF="${EPI_INTRINSIC_COEF:-0.3}"
+EPI_INTRINSIC_CAP="${EPI_INTRINSIC_CAP:-0.5}"
+EPI_INTRINSIC_USE_REF="${EPI_INTRINSIC_USE_REF:-False}"
+EPISTEMIC_INVERT_ON_NEG="${EPISTEMIC_INVERT_ON_NEG:-False}"
 
 ERC_ENABLE_VALUE="False"
 if [[ "${ENABLE_ERC}" == "1" ]]; then
   ERC_ENABLE_VALUE="True"
 fi
+
+# GRPO state-value baseline (turn-level redistribution). Default OFF; when
+# disabled all of these env vars are no-ops and code behavior is identical
+# to plain GRPO.
+USE_VALUE_BASELINE="${USE_VALUE_BASELINE:-False}"
+VALUE_LOSS_COEF="${VALUE_LOSS_COEF:-0.5}"
+VALUE_BASELINE_BETA="${VALUE_BASELINE_BETA:-1.0}"
+VALUE_BASELINE_BETA_WARMUP_STEPS="${VALUE_BASELINE_BETA_WARMUP_STEPS:-20}"
+VALUE_HEAD_MID_RATIO="${VALUE_HEAD_MID_RATIO:-4}"
+VALUE_HEAD_LR="${VALUE_HEAD_LR:-5e-4}"
+
+# Hindsight Credit Assignment (HCAPO, arXiv:2603.08754) — training-free
+# generative verification: re-prompt the frozen policy with the realized
+# outcome, no separate head / SFT. Independent of the value baseline
+# (HARD MUTEX). OFF (default) => behaviour matches pure GRPO.
+USE_HINDSIGHT_HCA="${USE_HINDSIGHT_HCA:-True}"
+# Self-normalized hindsight ratio rho = pi_hind / mean(pi_hind), clipped.
+HCA_RATIO_CLIP_MIN="${HCA_RATIO_CLIP_MIN:-0.8}"
+HCA_RATIO_CLIP_MAX="${HCA_RATIO_CLIP_MAX:-1.2}"
+# Sharpening temperature T_temp in pi_hind = exp(mean_log_p / T_temp).
+HCA_TEMP="${HCA_TEMP:-5.0}"
+# Weight of the micro (hindsight) advantage added to the GRPO macro advantage.
+HCA_OMEGA="${HCA_OMEGA:-1.0}"
+# Discount for the per-turn return G_t = gamma^{T-1-t} * R.
+HCA_GAMMA="${HCA_GAMMA:-0.95}"
+# Temporal smoothing Q_t = a*Q_t + (1-a)*Q_{t+1}; set 1.0 to disable.
+HCA_SMOOTH_ALPHA="${HCA_SMOOTH_ALPHA:-0.5}"
+# Reward threshold to label success (binary R in {0,1} => 0.5).
+HCA_Z_THRESHOLD="${HCA_Z_THRESHOLD:-0.5}"
+# HCA action-only ρ scoring: score on the action tokens (after the
+# delimiter) instead of the whole Thought+Action turn. Default OFF.
+HCA_ACTION_ONLY="${HCA_ACTION_ONLY:-False}"
+HCA_ACTION_DELIMITER="${HCA_ACTION_DELIMITER:-Action:}"
 
 WMC_COEFF="${WMC_COEFF:-0.01}"
 WMC_TYPE="${WMC_TYPE:-fixed}"
@@ -172,6 +232,9 @@ exec env \
     wmc_erc.clipping_type="${ERC_CLIPPING_TYPE}" \
     wmc_erc.clipping_method="${ERC_CLIPPING_METHOD}" \
     wmc_erc.momentum="${ERC_MOMENTUM}" \
+    +wmc_erc.uncertainty_scale_kappa="${UNCERTAINTY_SCALE_KAPPA}" \
+    +wmc_erc.uncertainty_scale_min="${UNCERTAINTY_SCALE_MIN}" \
+    +wmc_erc.uncertainty_scale_renormalize="${UNCERTAINTY_SCALE_RENORMALIZE}" \
     +wmc_erc.wmloss_add_coef="${WMLOSS_ADD_COEF}" \
     +wmc_erc.wmloss_add_use_entropy="${WMLOSS_ADD_USE_ENTROPY}" \
     +wmc_erc.wmloss_add_use_ema="${WMLOSS_ADD_USE_EMA}" \
@@ -180,6 +243,35 @@ exec env \
     +wmc_erc.wmloss_add_only_failed="${WMLOSS_ADD_ONLY_FAILED}" \
     +wmc_erc.wmloss_add_coef_end="${WMLOSS_ADD_COEF_END}" \
     +wmc_erc.wmloss_add_horizon="${WMLOSS_ADD_HORIZON}" \
+    +wmc_erc.wmloss_add_to_reward="${WMLOSS_ADD_TO_REWARD}" \
+    +wmc_erc.ref_nll_add="${REF_NLL_ADD}" \
+    +wmc_erc.ref_nll_coef="${REF_NLL_COEF}" \
+    +wmc_erc.epistemic_use_ref="${EPISTEMIC_USE_REF}" \
+    +wmc_erc.epistemic_base="${EPISTEMIC_BASE}" \
+    +wmc_erc.epistemic_base_neg="${EPISTEMIC_BASE_NEG}" \
+    +wmc_erc.epistemic_s_max="${EPISTEMIC_S_MAX}" \
+    +wmc_erc.epistemic_shape="${EPISTEMIC_SHAPE}" \
+    +wmc_erc.epistemic_pre_add_coef="${EPISTEMIC_PRE_ADD_COEF}" \
+    +wmc_erc.epistemic_invert_on_neg="${EPISTEMIC_INVERT_ON_NEG}" \
+    +wmc_erc.epi_intrinsic_coef="${EPI_INTRINSIC_COEF}" \
+    +wmc_erc.epi_intrinsic_cap="${EPI_INTRINSIC_CAP}" \
+    +wmc_erc.epi_intrinsic_use_ref="${EPI_INTRINSIC_USE_REF}" \
+    +actor_rollout_ref.actor.use_value_baseline="${USE_VALUE_BASELINE}" \
+    +actor_rollout_ref.actor.value_loss_coef="${VALUE_LOSS_COEF}" \
+    +actor_rollout_ref.actor.value_baseline_beta="${VALUE_BASELINE_BETA}" \
+    +actor_rollout_ref.actor.value_baseline_beta_warmup_steps="${VALUE_BASELINE_BETA_WARMUP_STEPS}" \
+    +actor_rollout_ref.actor.value_head_mid_ratio="${VALUE_HEAD_MID_RATIO}" \
+    +actor_rollout_ref.actor.value_head_lr="${VALUE_HEAD_LR}" \
+    +actor_rollout_ref.actor.use_hindsight_hca="${USE_HINDSIGHT_HCA}" \
+    +actor_rollout_ref.actor.hca_ratio_clip_min="${HCA_RATIO_CLIP_MIN}" \
+    +actor_rollout_ref.actor.hca_ratio_clip_max="${HCA_RATIO_CLIP_MAX}" \
+    +actor_rollout_ref.actor.hca_temp="${HCA_TEMP}" \
+    +actor_rollout_ref.actor.hca_omega="${HCA_OMEGA}" \
+    +actor_rollout_ref.actor.hca_gamma="${HCA_GAMMA}" \
+    +actor_rollout_ref.actor.hca_smooth_alpha="${HCA_SMOOTH_ALPHA}" \
+    +actor_rollout_ref.actor.hca_z_threshold="${HCA_Z_THRESHOLD}" \
+    +actor_rollout_ref.actor.hca_action_only="${HCA_ACTION_ONLY}" \
+    +actor_rollout_ref.actor.hca_action_delimiter="${HCA_ACTION_DELIMITER}" \
     actor_rollout_ref.actor.world_model_coeff="${WMC_COEFF}" \
     actor_rollout_ref.actor.world_model.enable="${WM_ENABLE}" \
     actor_rollout_ref.actor.world_model.env_predict_prompt="${WM_ENV_PREDICT_PROMPT}" \

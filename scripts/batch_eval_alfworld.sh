@@ -25,9 +25,9 @@ N_SAMPLES="${N_SAMPLES:-1}"
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-64}"
 
 BASE_3B_MODEL_PATH="${BASE_3B_MODEL_PATH:-/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/ziyu/.cache/huggingface/hub/models--Qwen--Qwen2.5-3B-Instruct}"
-BASE_7B_MODEL_PATH="${BASE_7B_MODEL_PATH:-/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/ziyu/.cache/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct}"
+BASE_7B_MODEL_PATH="${BASE_7B_MODEL_PATH:-/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/ziyu/.cache/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28}"
 CKPT_ROOT_3B="${CKPT_ROOT_3B:-${ROOT}/checkpoints/alfworld_grpo_qwen2.5_3b_wm_clip_20260420_025703}"
-CKPT_ROOT_7B="${CKPT_ROOT_7B:-${ROOT}/checkpoints_7b}"
+CKPT_ROOT_7B="${CKPT_ROOT_7B:-${ROOT}/checkpoints/alfworld_grpo_qwen2.5_3b_add_20260506_100312}"
 
 EVAL_DATA_DIR="${EVAL_DATA_DIR:-${ROOT}/AgentItemId/test}"
 EVAL_TEST_FILE="${EVAL_TEST_FILE:-${EVAL_DATA_DIR}/alfworld_test.json}"
@@ -129,14 +129,14 @@ MODEL_PATHS=()
 # MODEL_LABELS+=("base_7b")
 # MODEL_PATHS+=("${BASE_7B_MODEL_PATH}")
 
-mapfile -t CKPTS_3B < <(find "${CKPT_ROOT_3B}" -maxdepth 1 -type d -name 'global_step_*' | sort -V)
+# mapfile -t CKPTS_3B < <(find "${CKPT_ROOT_3B}" -maxdepth 1 -type d -name 'global_step_*' | sort -V)
 mapfile -t CKPTS_7B < <(find "${CKPT_ROOT_7B}" -maxdepth 1 -type d -name 'global_step_*' | sort -V)
 
-for ckpt_dir in "${CKPTS_3B[@]}"; do
-  step_name="$(basename "${ckpt_dir}")"
-  MODEL_LABELS+=("3b_${step_name}")
-  MODEL_PATHS+=("${ckpt_dir}/actor/huggingface")
-done
+# for ckpt_dir in "${CKPTS_3B[@]}"; do
+#   step_name="$(basename "${ckpt_dir}")"
+#   MODEL_LABELS+=("3b_${step_name}")
+#   MODEL_PATHS+=("${ckpt_dir}/actor/huggingface")
+# done
 
 for ckpt_dir in "${CKPTS_7B[@]}"; do
   step_name="$(basename "${ckpt_dir}")"

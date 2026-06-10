@@ -7,6 +7,8 @@ TRAIN_CODE_DIR="${ROOT}/AgentGym-RL"
 CONDA_SH="${CONDA_SH:-/opt/conda/etc/profile.d/conda.sh}"
 TRAIN_ENV="${TRAIN_ENV:-/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/cy/conda_envs/agentgym-rl}"
 MODEL_PATH="${MODEL_PATH:-/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/ziyu/.cache/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28}"
+# /inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/ziyu/.cache/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28
+# /inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/ziyu/.cache/huggingface/hub/models--Qwen--Qwen2.5-3B-Instruct
 TASK_NAME="alfworld"
 
 export HF_HUB_OFFLINE=1
@@ -45,8 +47,8 @@ PPO_MICRO_BATCH_SIZE_PER_GPU="${PPO_MICRO_BATCH_SIZE_PER_GPU:-1}"
 PPO_EPOCHS="${PPO_EPOCHS:-1}"
 TOTAL_EPOCHS="${TOTAL_EPOCHS:-2}"
 MAX_ROUNDS="${MAX_ROUNDS:-20}"
-MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-2048}"
-MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-4096}"
+MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-1024}"
+MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-8192}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-8192}"
 MAX_TOKENS_PER_TURN="${MAX_TOKENS_PER_TURN:-512}"
 ROLLOUT_GPU_MEMORY_UTILIZATION="${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.80}"
@@ -58,21 +60,118 @@ ERC_MU_EXP="${ERC_MU_EXP:-1.5}"
 ERC_ETA_WM="${ERC_ETA_WM:-2.0}"
 ERC_LAMBDA_WM="${ERC_LAMBDA_WM:-1.0}"
 ERC_CLIPPING_TYPE="${ERC_CLIPPING_TYPE:-global}"
-ERC_CLIPPING_METHOD="${ERC_CLIPPING_METHOD:-add}"
+# Default: epi_intrinsic_add (Design A) — pure non-negative additive intrinsic
+# bonus on advantage:  A_t += EPI_INTRINSIC_COEF * min(U_t, EPI_INTRINSIC_CAP),
+# with U_t = max(0, NLL_t - H_t). Calibration-gap ICM variant (noisy-TV-robust)
+# applied at the advantage layer, parallel to and reinforcing WM-SFT
+# (WM-SFT is active whenever WMC_COEFF > 0; default 0.01).
+# Other methods: 'add' (baseline-style additive entropy/NLL/gap with batch-
+# mean recentering), 'epistemic_scale' (multiplicative per-turn redistribution
+# with sign-asymmetric base / invert / pre_add knobs), or 'mask'/'sigmoid'/etc.
+ERC_CLIPPING_METHOD="${ERC_CLIPPING_METHOD:-uncertainty_scale}"
 ERC_MOMENTUM="${ERC_MOMENTUM:-0.8}"
-WMLOSS_ADD_COEF="${WMLOSS_ADD_COEF:-0.2}"
+# Uncertainty-scaling (set ERC_CLIPPING_METHOD=uncertainty_scale to use):
+# shrink advantage on turns with high next-obs env entropy (model unsure
+# what its action causes) to prevent action-entropy collapse there.
+UNCERTAINTY_SCALE_KAPPA="${UNCERTAINTY_SCALE_KAPPA:-1.0}"
+UNCERTAINTY_SCALE_MIN="${UNCERTAINTY_SCALE_MIN:-0.7}"
+UNCERTAINTY_SCALE_RENORMALIZE="${UNCERTAINTY_SCALE_RENORMALIZE:-True}"
+WMLOSS_ADD_COEF="${WMLOSS_ADD_COEF:-0.5}"
 WMLOSS_ADD_COEF_END="${WMLOSS_ADD_COEF_END:-0}"
 WMLOSS_ADD_HORIZON="${WMLOSS_ADD_HORIZON:-0}"
 WMLOSS_ADD_USE_ENTROPY="${WMLOSS_ADD_USE_ENTROPY:-True}"
+# use_gap: build the additive advantage bonus from the epistemic calibration
+# gap max(0, NLL - H) instead of raw entropy/NLL. Same add mechanism as the
+# baseline, better (noisy-TV-robust) signal. Requires ERC_CLIPPING_METHOD=add.
+WMLOSS_ADD_USE_GAP="${WMLOSS_ADD_USE_GAP:-False}"
 WMLOSS_ADD_USE_EMA="${WMLOSS_ADD_USE_EMA:-False}"
-WMLOSS_ADD_USE_GROUPED="${WMLOSS_ADD_USE_GROUPED:-False}"
+WMLOSS_ADD_USE_GROUPED="${WMLOSS_ADD_USE_GROUPED:-True}"
 WMLOSS_ADD_USE_REF_BASELINE="${WMLOSS_ADD_USE_REF_BASELINE:-False}"
 WMLOSS_ADD_ONLY_FAILED="${WMLOSS_ADD_ONLY_FAILED:-False}"
+WMLOSS_ADD_TO_REWARD="${WMLOSS_ADD_TO_REWARD:-False}"
+# ref_nll_add: OVERRIDES all other wmc_erc paths. Adds REF_NLL_COEF *
+# (frozen initial ref model env-token NLL) directly to advantage per turn.
+REF_NLL_ADD="${REF_NLL_ADD:-False}"
+REF_NLL_COEF="${REF_NLL_COEF:-0.4}"
+# Epistemic advantage scaling (set ERC_CLIPPING_METHOD=epistemic_scale to use).
+# Sign-preserving, trajectory-normalized credit redistribution driven by the
+# world-model calibration gap (NLL - entropy). EPISTEMIC_BASE is the
+# aggressiveness floor in units of the EMA mean signal (larger = milder),
+# EPISTEMIC_S_MAX caps per-turn normalized signal, EPISTEMIC_USE_REF switches
+# to the cross-model (current-vs-ref) epistemic proxy when ref_entropy exists.
+EPISTEMIC_USE_REF="${EPISTEMIC_USE_REF:-False}"
+EPISTEMIC_BASE="${EPISTEMIC_BASE:-1.0}"
+EPISTEMIC_S_MAX="${EPISTEMIC_S_MAX:-5.0}"
+# Concave U->weight shaping: linear | sqrt | log (sqrt = sharp at low U,
+# saturating at high U). EPISTEMIC_BASE_NEG >= EPISTEMIC_BASE makes losing
+# trajectories redistribute more gently (protect exploration); default ==
+# EPISTEMIC_BASE i.e. symmetric. Set larger (e.g. 2x) to enable the asymmetry.
+EPISTEMIC_SHAPE="${EPISTEMIC_SHAPE:-linear}"
+EPISTEMIC_BASE_NEG="${EPISTEMIC_BASE_NEG:-5.0}"
+# Optional small additive raw-entropy bonus applied BEFORE the epi_scale
+# multiplicative redistribution (mimics baseline's net exploration push,
+# which pure redistribution cannot supply). 0 = off (default).
+EPISTEMIC_PRE_ADD_COEF="${EPISTEMIC_PRE_ADD_COEF:-0.0}"
+# Design A: pure non-negative additive intrinsic bonus on advantage.
+#   A_t += EPI_INTRINSIC_COEF * min(U_t, EPI_INTRINSIC_CAP), U=max(0, NLL-H).
+# Use with ERC_CLIPPING_METHOD=epi_intrinsic_add. No recentering, no per-turn
+# redistribution -- just a calibration-gap intrinsic reward at the advantage
+# layer (noisy-TV-robust ICM variant), parallel to WM-SFT.
+EPI_INTRINSIC_COEF="${EPI_INTRINSIC_COEF:-0.3}"
+EPI_INTRINSIC_CAP="${EPI_INTRINSIC_CAP:-0.5}"
+EPI_INTRINSIC_USE_REF="${EPI_INTRINSIC_USE_REF:-False}"
+# On FAILURE trajectories (A_grpo<0) only: flip s_t -> (s_max - s_t) so that
+# routine/loop turns (low U) get heaviest punishment and exploratory turns
+# (high U) get protected. Corrects the structural anti-exploration bias on
+# failures that we diagnosed in 174247 (stuck-loop dup% 73% by turn 20).
+# Off by default; recovers symmetric behavior.
+EPISTEMIC_INVERT_ON_NEG="${EPISTEMIC_INVERT_ON_NEG:-True}"
 
 ERC_ENABLE_VALUE="False"
 if [[ "${ENABLE_ERC}" == "1" ]]; then
   ERC_ENABLE_VALUE="True"
 fi
+
+# GRPO state-value baseline (turn-level redistribution). Default OFF; when
+# disabled all of these env vars are no-ops and code behavior is identical
+# to plain GRPO. When ON, a small value head is attached to the actor
+# backbone, V(s_t) is read at the position right before the first action
+# token of every turn, and the scalar GRPO advantage is redistributed as
+# A_t = Â − β·(V̂_t − mean_t V̂_t) (trajectory mean preserved).
+USE_VALUE_BASELINE="${USE_VALUE_BASELINE:-False}"
+VALUE_LOSS_COEF="${VALUE_LOSS_COEF:-0.5}"
+VALUE_BASELINE_BETA="${VALUE_BASELINE_BETA:-0.5}"
+# Linear warmup on β: β_eff = β · min(1, step / warmup). Default 20 steps
+# covers the empirically noisy-V window (step 8-24 in the 5.31 alfworld run).
+VALUE_BASELINE_BETA_WARMUP_STEPS="${VALUE_BASELINE_BETA_WARMUP_STEPS:-20}"
+VALUE_HEAD_MID_RATIO="${VALUE_HEAD_MID_RATIO:-4}"
+# Independent lr for value_head params. Lowered from 1e-3 to 5e-4 because
+# 1e-3 made V wander noisily (V_mean swung -0.13 to +1.0 across steps 8-24
+# while chasing per-batch R variance), feeding noise into redistribution.
+VALUE_HEAD_LR="${VALUE_HEAD_LR:-5e-4}"
+
+# Hindsight Credit Assignment (HCAPO, arXiv:2603.08754) — training-free
+# generative verification: re-prompt the frozen policy with the realized
+# outcome, no separate head / SFT. Independent of the value baseline
+# (HARD MUTEX). OFF (default) => behaviour matches pure GRPO.
+USE_HINDSIGHT_HCA="${USE_HINDSIGHT_HCA:-False}"
+# Self-normalized hindsight ratio rho = pi_hind / mean(pi_hind), clipped.
+HCA_RATIO_CLIP_MIN="${HCA_RATIO_CLIP_MIN:-0.8}"
+HCA_RATIO_CLIP_MAX="${HCA_RATIO_CLIP_MAX:-1.2}"
+# Sharpening temperature T_temp in pi_hind = exp(mean_log_p / T_temp).
+HCA_TEMP="${HCA_TEMP:-5.0}"
+# Weight of the micro (hindsight) advantage added to the GRPO macro advantage.
+HCA_OMEGA="${HCA_OMEGA:-1.0}"
+# Discount for the per-turn return G_t = gamma^{T-1-t} * R.
+HCA_GAMMA="${HCA_GAMMA:-0.95}"
+# Temporal smoothing Q_t = a*Q_t + (1-a)*Q_{t+1}; set 1.0 to disable.
+HCA_SMOOTH_ALPHA="${HCA_SMOOTH_ALPHA:-0.5}"
+# Reward threshold to label success (binary R in {0,1} => 0.5).
+HCA_Z_THRESHOLD="${HCA_Z_THRESHOLD:-0.5}"
+# HCA action-only ρ scoring: score on the action tokens (after the
+# delimiter) instead of the whole Thought+Action turn. Default OFF.
+HCA_ACTION_ONLY="${HCA_ACTION_ONLY:-False}"
+HCA_ACTION_DELIMITER="${HCA_ACTION_DELIMITER:-Action:}"
 
 WMC_COEFF="${WMC_COEFF:-0.01}"
 WMC_TYPE="${WMC_TYPE:-fixed}"
@@ -90,7 +189,7 @@ WM_MAX_LENGTH="${WM_MAX_LENGTH:-4096}"
 WM_MAX_SAMPLES_PER_TRAJECTORY="${WM_MAX_SAMPLES_PER_TRAJECTORY:-null}"
 WM_MIN_ENV_TOKENS="${WM_MIN_ENV_TOKENS:-1}"
 
-EXP_NAME="${EXP_NAME:-alfworld_grpo_qwen2.5_3b_$(date -u +%Y%m%d_%H%M%S)}"
+EXP_NAME="${EXP_NAME:-alfworld_grpo_qwen2.5_7b_$(date -u +%Y%m%d_%H%M%S)}"
 CKPT_DIR="${CKPT_DIR:-${ROOT}/checkpoints/${EXP_NAME}}"
 RUN_DIR="${RUN_DIR:-${ROOT}/runlogs/${EXP_NAME}}"
 ROLLOUT_LOG_DIR="${ROLLOUT_LOG_DIR:-${RUN_DIR}/rollout_logs}"
@@ -172,14 +271,47 @@ exec env \
     wmc_erc.clipping_type="${ERC_CLIPPING_TYPE}" \
     wmc_erc.clipping_method="${ERC_CLIPPING_METHOD}" \
     wmc_erc.momentum="${ERC_MOMENTUM}" \
+    +wmc_erc.uncertainty_scale_kappa="${UNCERTAINTY_SCALE_KAPPA}" \
+    +wmc_erc.uncertainty_scale_min="${UNCERTAINTY_SCALE_MIN}" \
+    +wmc_erc.uncertainty_scale_renormalize="${UNCERTAINTY_SCALE_RENORMALIZE}" \
     +wmc_erc.wmloss_add_coef="${WMLOSS_ADD_COEF}" \
     +wmc_erc.wmloss_add_use_entropy="${WMLOSS_ADD_USE_ENTROPY}" \
+    +wmc_erc.wmloss_add_use_gap="${WMLOSS_ADD_USE_GAP}" \
     +wmc_erc.wmloss_add_use_ema="${WMLOSS_ADD_USE_EMA}" \
     +wmc_erc.wmloss_add_use_grouped="${WMLOSS_ADD_USE_GROUPED}" \
     +wmc_erc.wmloss_add_use_ref_baseline="${WMLOSS_ADD_USE_REF_BASELINE}" \
     +wmc_erc.wmloss_add_only_failed="${WMLOSS_ADD_ONLY_FAILED}" \
     +wmc_erc.wmloss_add_coef_end="${WMLOSS_ADD_COEF_END}" \
     +wmc_erc.wmloss_add_horizon="${WMLOSS_ADD_HORIZON}" \
+    +wmc_erc.wmloss_add_to_reward="${WMLOSS_ADD_TO_REWARD}" \
+    +wmc_erc.ref_nll_add="${REF_NLL_ADD}" \
+    +wmc_erc.ref_nll_coef="${REF_NLL_COEF}" \
+    +wmc_erc.epistemic_use_ref="${EPISTEMIC_USE_REF}" \
+    +wmc_erc.epistemic_base="${EPISTEMIC_BASE}" \
+    +wmc_erc.epistemic_base_neg="${EPISTEMIC_BASE_NEG}" \
+    +wmc_erc.epistemic_s_max="${EPISTEMIC_S_MAX}" \
+    +wmc_erc.epistemic_shape="${EPISTEMIC_SHAPE}" \
+    +wmc_erc.epistemic_pre_add_coef="${EPISTEMIC_PRE_ADD_COEF}" \
+    +wmc_erc.epistemic_invert_on_neg="${EPISTEMIC_INVERT_ON_NEG}" \
+    +wmc_erc.epi_intrinsic_coef="${EPI_INTRINSIC_COEF}" \
+    +wmc_erc.epi_intrinsic_cap="${EPI_INTRINSIC_CAP}" \
+    +wmc_erc.epi_intrinsic_use_ref="${EPI_INTRINSIC_USE_REF}" \
+    +actor_rollout_ref.actor.use_value_baseline="${USE_VALUE_BASELINE}" \
+    +actor_rollout_ref.actor.value_loss_coef="${VALUE_LOSS_COEF}" \
+    +actor_rollout_ref.actor.value_baseline_beta="${VALUE_BASELINE_BETA}" \
+    +actor_rollout_ref.actor.value_baseline_beta_warmup_steps="${VALUE_BASELINE_BETA_WARMUP_STEPS}" \
+    +actor_rollout_ref.actor.value_head_mid_ratio="${VALUE_HEAD_MID_RATIO}" \
+    +actor_rollout_ref.actor.value_head_lr="${VALUE_HEAD_LR}" \
+    +actor_rollout_ref.actor.use_hindsight_hca="${USE_HINDSIGHT_HCA}" \
+    +actor_rollout_ref.actor.hca_ratio_clip_min="${HCA_RATIO_CLIP_MIN}" \
+    +actor_rollout_ref.actor.hca_ratio_clip_max="${HCA_RATIO_CLIP_MAX}" \
+    +actor_rollout_ref.actor.hca_temp="${HCA_TEMP}" \
+    +actor_rollout_ref.actor.hca_omega="${HCA_OMEGA}" \
+    +actor_rollout_ref.actor.hca_gamma="${HCA_GAMMA}" \
+    +actor_rollout_ref.actor.hca_smooth_alpha="${HCA_SMOOTH_ALPHA}" \
+    +actor_rollout_ref.actor.hca_z_threshold="${HCA_Z_THRESHOLD}" \
+    +actor_rollout_ref.actor.hca_action_only="${HCA_ACTION_ONLY}" \
+    +actor_rollout_ref.actor.hca_action_delimiter="${HCA_ACTION_DELIMITER}" \
     actor_rollout_ref.actor.world_model_coeff="${WMC_COEFF}" \
     actor_rollout_ref.actor.world_model.enable="${WM_ENABLE}" \
     actor_rollout_ref.actor.world_model.env_predict_prompt="${WM_ENV_PREDICT_PROMPT}" \

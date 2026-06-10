@@ -357,7 +357,8 @@ class ActorRolloutRefWorker(Worker):
                 self.config.actor.use_remove_padding = use_remove_padding
             self.actor = DataParallelPPOActor(config=self.config.actor,
                                               actor_module=self.actor_module_fsdp,
-                                              actor_optimizer=self.actor_optimizer)
+                                              actor_optimizer=self.actor_optimizer,
+                                              model_config=self.actor_model_config)
 
         if self._is_rollout:
             self.rollout, self.rollout_sharding_manager = self._build_rollout()
@@ -557,6 +558,102 @@ class ActorRolloutRefWorker(Worker):
         # clear kv cache
         torch.cuda.empty_cache()
         log_gpu_memory_usage('After compute_log_prob', logger=logger)
+        return output
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    def compute_state_values(self, data: DataProto):
+        """Compute per-turn state values V(s_t) using the actor's value head.
+
+        Only valid when the actor was constructed with use_value_baseline=True
+        (otherwise self.actor.value_head is None and this will assert).
+        """
+        assert self._is_actor
+        if self._is_offload_param:
+            load_fsdp_param_and_grad(module=self.actor_module_fsdp,
+                                     device_id=torch.cuda.current_device(),
+                                     load_grad=self._is_offload_grad)
+        data = data.to('cuda')
+        data.meta_info['micro_batch_size'] = self.config.rollout.log_prob_micro_batch_size_per_gpu
+        data.meta_info['max_token_len'] = self.config.rollout.log_prob_max_token_len_per_gpu
+        data.meta_info['use_dynamic_bsz'] = self.config.rollout.log_prob_use_dynamic_bsz
+        data.meta_info['temperature'] = self.config.rollout.temperature
+        with self.ulysses_sharding_manager:
+            data = self.ulysses_sharding_manager.preprocess_data(data)
+            state_values, state_values_mask = self.actor.compute_state_values(data=data)
+            output = DataProto.from_dict(
+                tensors={'state_values': state_values, 'state_values_mask': state_values_mask})
+            output = self.ulysses_sharding_manager.postprocess_data(output)
+
+        output = output.to('cpu')
+
+        if self.world_size > 1:
+            self.actor.actor_module._handle.reshard(True)
+
+        if self._is_offload_param:
+            offload_fsdp_param_and_grad(module=self.actor_module_fsdp, offload_grad=self._is_offload_grad)
+
+        torch.cuda.empty_cache()
+        return output
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    def compute_hindsight_log_probs(self, data: DataProto):
+        """Inference call: per-action-token log π(a|s, s_final) log probs under
+        the outcome-conditioned context (HCAPO Generative Verification).
+
+        Builds the realized-outcome statement prefixes here (needs the
+        tokenizer) and passes their token ids to the actor via meta_info.
+        Only valid when the actor was constructed with use_hindsight_hca=True.
+        """
+        assert self._is_actor
+        if self._is_offload_param:
+            load_fsdp_param_and_grad(module=self.actor_module_fsdp,
+                                     device_id=torch.cuda.current_device(),
+                                     load_grad=self._is_offload_grad)
+        data = data.to('cuda')
+        data.meta_info['micro_batch_size'] = self.config.rollout.log_prob_micro_batch_size_per_gpu
+        data.meta_info['max_token_len'] = self.config.rollout.log_prob_max_token_len_per_gpu
+        data.meta_info['use_dynamic_bsz'] = self.config.rollout.log_prob_use_dynamic_bsz
+        data.meta_info['temperature'] = self.config.rollout.temperature
+
+        # Realized-outcome statements injected as a context prefix. Index 0 is
+        # the failure outcome (z=0), index 1 the success outcome (z=1). The
+        # frozen policy reads these and re-judges how likely each action was
+        # given the known outcome — no training involved.
+        outcome_templates = [
+            "[Hindsight] In the end, this attempt FAILED to complete the task. "
+            "Re-judge the actions below given that the task was not solved.\n",
+            "[Hindsight] In the end, this attempt SUCCESSFULLY completed the task. "
+            "Re-judge the actions below given that the task was solved.\n",
+        ]
+        tok_ids = [self.tokenizer(t, add_special_tokens=False)['input_ids']
+                   for t in outcome_templates]
+        K = max(len(t) for t in tok_ids)
+        pad_id = self.tokenizer.pad_token_id
+        if pad_id is None:
+            pad_id = self.tokenizer.eos_token_id
+        # Left-pad each template to a common length K so all samples grow by K.
+        prefix_ids = torch.tensor(
+            [[pad_id] * (K - len(t)) + list(t) for t in tok_ids], dtype=torch.long)
+        prefix_mask = torch.tensor(
+            [[0] * (K - len(t)) + [1] * len(t) for t in tok_ids], dtype=torch.long)
+        data.meta_info['hca_prefix_ids'] = prefix_ids
+        data.meta_info['hca_prefix_mask'] = prefix_mask
+
+        with self.ulysses_sharding_manager:
+            data = self.ulysses_sharding_manager.preprocess_data(data)
+            h_log_probs = self.actor.compute_hindsight_log_probs(data=data)
+            output = DataProto.from_dict(tensors={'h_log_probs': h_log_probs})
+            output = self.ulysses_sharding_manager.postprocess_data(output)
+
+        output = output.to('cpu')
+
+        if self.world_size > 1:
+            self.actor.actor_module._handle.reshard(True)
+
+        if self._is_offload_param:
+            offload_fsdp_param_and_grad(module=self.actor_module_fsdp, offload_grad=self._is_offload_grad)
+
+        torch.cuda.empty_cache()
         return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
