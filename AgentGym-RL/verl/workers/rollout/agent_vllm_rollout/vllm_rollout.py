@@ -205,6 +205,30 @@ class vLLMRollout(BaseRollout):
             return task_score
 
     @torch.no_grad()
+    def generate_text_batch(self, prompt_token_ids, max_new_tokens: int = 24):
+        """Plain (single-turn) greedy text generation for the safe-commit text gate.
+
+        Unlike generate_sequences (a full multi-turn agent rollout), this just runs
+        the underlying LLM on a list of pre-tokenized prompts and returns the decoded
+        completions. Used to classify per-turn outcome predictability. Greedy/short.
+        """
+        if self.config.free_cache_engine:
+            self.inference_engine.init_cache_engine()
+        try:
+            sp = SamplingParams(n=1, temperature=0.0, top_p=1.0, top_k=-1,
+                                max_tokens=int(max_new_tokens))
+            outs = self.inference_engine.generate(
+                prompts=None, prompt_token_ids=list(prompt_token_ids),
+                sampling_params=sp, use_tqdm=False)
+            texts = []
+            for o in outs:
+                ids = o.outputs[0].token_ids if hasattr(o, "outputs") else o
+                texts.append(self.tokenizer.decode(list(ids), skip_special_tokens=True))
+        finally:
+            if self.config.free_cache_engine:
+                self.inference_engine.free_cache_engine()
+        return texts
+
     def generate_sequences(self, prompts: DataProto, **kwargs) -> DataProto:
         # rebuild vllm cache engine
         if self.config.free_cache_engine:

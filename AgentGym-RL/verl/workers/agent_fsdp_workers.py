@@ -519,6 +519,29 @@ class ActorRolloutRefWorker(Worker):
         return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    def generate_classification(self, data: DataProto):
+        """Safe-commit text gate: plain greedy generation over pre-tokenized
+        classification prompts (input_ids left-padded, attention_mask), parsed
+        on-worker into a predictability bit. Returns a DataProto with tensor
+        'clf_predictable' (N,) ∈ {0,1} (1 = outcome DETERMINISTIC). Default-off path.
+        """
+        from verl.agent_trainer.ppo.safe_commit_gate import parse_predictable
+        assert self._is_rollout
+        data = data.to('cuda')
+        max_new = int(data.meta_info.get('clf_max_new_tokens', 24))
+        input_ids = data.batch['input_ids']
+        attn = data.batch['attention_mask']
+        # strip left padding → list of real prompt token-id lists
+        prompt_ids = [input_ids[i][attn[i].bool()].tolist() for i in range(input_ids.size(0))]
+        with self.rollout_sharding_manager:
+            texts = self.rollout.generate_text_batch(prompt_ids, max_new_tokens=max_new)
+        pred = torch.tensor([parse_predictable(t) for t in texts], dtype=torch.long)
+        output = DataProto.from_dict(tensors={'clf_predictable': pred})
+        output = output.to('cpu')
+        torch.cuda.empty_cache()
+        return output
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_log_prob(self, data: DataProto):
         assert self._is_actor
         if self._is_offload_param:
@@ -615,29 +638,49 @@ class ActorRolloutRefWorker(Worker):
         data.meta_info['use_dynamic_bsz'] = self.config.rollout.log_prob_use_dynamic_bsz
         data.meta_info['temperature'] = self.config.rollout.temperature
 
-        # Realized-outcome statements injected as a context prefix. Index 0 is
-        # the failure outcome (z=0), index 1 the success outcome (z=1). The
-        # frozen policy reads these and re-judges how likely each action was
-        # given the known outcome — no training involved.
-        outcome_templates = [
-            "[Hindsight] In the end, this attempt FAILED to complete the task. "
-            "Re-judge the actions below given that the task was not solved.\n",
-            "[Hindsight] In the end, this attempt SUCCESSFULLY completed the task. "
-            "Re-judge the actions below given that the task was solved.\n",
-        ]
-        tok_ids = [self.tokenizer(t, add_special_tokens=False)['input_ids']
-                   for t in outcome_templates]
-        K = max(len(t) for t in tok_ids)
+        # Build the per-trajectory FINAL-STATE hindsight hint (HCAPO §4.2: inject
+        # the realized outcome s_final). s_final = the trajectory's most recent
+        # env observation = the LAST contiguous run of env tokens (response_mask=0
+        # & attended) in the response. This is env-agnostic: works whether the
+        # trajectory ends on an action (sciworld) or an observation (webshop).
+        # The hint is added to data.batch so it splits with the micro-batches; the
+        # actor inserts it right BEFORE the response region (local, single forward).
+        M = int(self.config.actor.get('hca_final_state_max_tokens', 96))
+        responses = data.batch['responses']                       # (B, Tr)
+        resp_mask = data.batch['response_mask']                   # (B, Tr) 1 on action toks
+        Tr = responses.size(1)
+        attn_resp = data.batch['attention_mask'][:, -Tr:]
+        # Neutral, declarative hindsight knowledge — NO "judge/evaluate" instruction.
+        # We only read the policy's log-prob of the (fixed) action tokens under this
+        # context; an instruction to "judge" would make the model expect a judgment
+        # next and distort the log-prob of the actual actions that follow.
+        pre_t = self.tokenizer(
+            "\n[Hindsight] Knowing in advance that this episode ultimately ends in the "
+            "following final state:\n",
+            add_special_tokens=False)['input_ids']
+        suf_t = self.tokenizer("\n", add_special_tokens=False)['input_ids']
         pad_id = self.tokenizer.pad_token_id
         if pad_id is None:
             pad_id = self.tokenizer.eos_token_id
-        # Left-pad each template to a common length K so all samples grow by K.
-        prefix_ids = torch.tensor(
-            [[pad_id] * (K - len(t)) + list(t) for t in tok_ids], dtype=torch.long)
-        prefix_mask = torch.tensor(
-            [[0] * (K - len(t)) + [1] * len(t) for t in tok_ids], dtype=torch.long)
-        data.meta_info['hca_prefix_ids'] = prefix_ids
-        data.meta_info['hca_prefix_mask'] = prefix_mask
+        Bsz = responses.size(0)
+        hints = []
+        for i in range(Bsz):
+            obs = attn_resp[i].bool() & (resp_mask[i] == 0)       # env-observation tokens
+            idx = obs.nonzero(as_tuple=True)[0]
+            if idx.numel() > 0:                                   # last contiguous obs run
+                brk = (idx[1:] - idx[:-1] > 1).nonzero(as_tuple=True)[0]
+                start = int(idx[int(brk[-1].item()) + 1].item()) if brk.numel() else int(idx[0].item())
+                fs_ids = responses[i, start: int(idx[-1].item()) + 1].tolist()[:M]
+            else:
+                fs_ids = []                                       # no obs ⇒ empty final state
+            hints.append(pre_t + fs_ids + suf_t)
+        K = max(len(h) for h in hints)
+        hint_ids = torch.tensor([[pad_id] * (K - len(h)) + h for h in hints],
+                                dtype=torch.long, device=responses.device)
+        hint_mask = torch.tensor([[0] * (K - len(h)) + [1] * len(h) for h in hints],
+                                 dtype=torch.long, device=responses.device)
+        data.batch['hca_hint_ids'] = hint_ids
+        data.batch['hca_hint_mask'] = hint_mask
 
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data)

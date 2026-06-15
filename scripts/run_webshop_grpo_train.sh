@@ -66,6 +66,26 @@ ERC_MOMENTUM="${ERC_MOMENTUM:-0.5}"
 UNCERTAINTY_SCALE_KAPPA="${UNCERTAINTY_SCALE_KAPPA:-1.0}"
 UNCERTAINTY_SCALE_MIN="${UNCERTAINTY_SCALE_MIN:-0.5}"
 UNCERTAINTY_SCALE_RENORMALIZE="${UNCERTAINTY_SCALE_RENORMALIZE:-True}"
+# Safe-Commit Sharpener (set ERC_CLIPPING_METHOD=safe_commit): AMPLIFY advantage on
+# safe-to-commit turns (low next-obs env entropy U) to accelerate commit. Opposite
+# sign of uncertainty_scale; mean-preserving (renorm) => trajectory-unbiased.
+# Additive-boost mode: SAFE_COMMIT_GMIN=1.0 + SAFE_COMMIT_RENORMALIZE=False.
+SAFE_COMMIT_MODE="${SAFE_COMMIT_MODE:-add}"            # add (HCA-scale additive) | redistribute (mean-preserving)
+SAFE_COMMIT_OMEGA="${SAFE_COMMIT_OMEGA:-1.0}"          # add-mode magnitude dial; omega=1.0 ~= HCA scale
+SAFE_COMMIT_RECENCY="${SAFE_COMMIT_RECENCY:-0.0}"         # add: 0=pure content; >0 tilts boost to late (success end-game) turns
+SAFE_COMMIT_RECENCY_GAMMA="${SAFE_COMMIT_RECENCY_GAMMA:-0.95}"
+SAFE_COMMIT_SUCCESS_THRESHOLD="${SAFE_COMMIT_SUCCESS_THRESHOLD:-0.0}"  # add-mode: win = traj A_GRPO > thr
+SAFE_COMMIT_KAPPA="${SAFE_COMMIT_KAPPA:-1.0}"
+# Text gate (DEFAULT OFF): per-turn ask model if outcome predictable, AND with low
+# action-entropy -> only commit-boost turns that are BOTH predictable AND low-entropy.
+SAFE_COMMIT_TEXT_GATE="${SAFE_COMMIT_TEXT_GATE:-False}"
+SAFE_COMMIT_GATE_MODE="${SAFE_COMMIT_GATE_MODE:-and}"          # and (strict) | soft
+SAFE_COMMIT_CLF_ENV="${SAFE_COMMIT_CLF_ENV:-alfworld}"         # domain slot for classifier prompt
+SAFE_COMMIT_CLF_WINS_ONLY="${SAFE_COMMIT_CLF_WINS_ONLY:-True}" # classify only winning trajectories
+SAFE_COMMIT_CLF_MAX_NEW="${SAFE_COMMIT_CLF_MAX_NEW:-24}"
+SAFE_COMMIT_GMAX="${SAFE_COMMIT_GMAX:-2.0}"
+SAFE_COMMIT_GMIN="${SAFE_COMMIT_GMIN:-0.5}"
+SAFE_COMMIT_RENORMALIZE="${SAFE_COMMIT_RENORMALIZE:-True}"
 WMLOSS_ADD_COEF="${WMLOSS_ADD_COEF:-0.2}"
 WMLOSS_ADD_COEF_END="${WMLOSS_ADD_COEF_END:-0}"
 WMLOSS_ADD_HORIZON="${WMLOSS_ADD_HORIZON:-0}"
@@ -129,10 +149,10 @@ HCA_GAMMA="${HCA_GAMMA:-0.95}"
 HCA_SMOOTH_ALPHA="${HCA_SMOOTH_ALPHA:-0.5}"
 # Reward threshold to label success (binary R in {0,1} => 0.5).
 HCA_Z_THRESHOLD="${HCA_Z_THRESHOLD:-0.5}"
+# Max tokens of the realized FINAL STATE injected as hindsight (env-agnostic).
+HCA_FINAL_STATE_MAX_TOKENS="${HCA_FINAL_STATE_MAX_TOKENS:-96}"
 # HCA action-only ρ scoring: score on the action tokens (after the
 # delimiter) instead of the whole Thought+Action turn. Default OFF.
-HCA_ACTION_ONLY="${HCA_ACTION_ONLY:-False}"
-HCA_ACTION_DELIMITER="${HCA_ACTION_DELIMITER:-Action:}"
 
 WMC_COEFF="${WMC_COEFF:-0.01}"
 WMC_TYPE="${WMC_TYPE:-fixed}"
@@ -235,6 +255,20 @@ exec env \
     +wmc_erc.uncertainty_scale_kappa="${UNCERTAINTY_SCALE_KAPPA}" \
     +wmc_erc.uncertainty_scale_min="${UNCERTAINTY_SCALE_MIN}" \
     +wmc_erc.uncertainty_scale_renormalize="${UNCERTAINTY_SCALE_RENORMALIZE}" \
+    +wmc_erc.safe_commit_mode="${SAFE_COMMIT_MODE}" \
+    +wmc_erc.safe_commit_omega="${SAFE_COMMIT_OMEGA}" \
+    +wmc_erc.safe_commit_recency="${SAFE_COMMIT_RECENCY}" \
+    +wmc_erc.safe_commit_recency_gamma="${SAFE_COMMIT_RECENCY_GAMMA}" \
+    +wmc_erc.safe_commit_success_threshold="${SAFE_COMMIT_SUCCESS_THRESHOLD}" \
+    +wmc_erc.safe_commit_kappa="${SAFE_COMMIT_KAPPA}" \
+    +wmc_erc.safe_commit_gmax="${SAFE_COMMIT_GMAX}" \
+    +wmc_erc.safe_commit_gmin="${SAFE_COMMIT_GMIN}" \
+    +wmc_erc.safe_commit_renormalize="${SAFE_COMMIT_RENORMALIZE}" \
+    +wmc_erc.safe_commit_text_gate="${SAFE_COMMIT_TEXT_GATE}" \
+    +wmc_erc.safe_commit_gate_mode="${SAFE_COMMIT_GATE_MODE}" \
+    +wmc_erc.safe_commit_clf_env="${SAFE_COMMIT_CLF_ENV}" \
+    +wmc_erc.safe_commit_clf_wins_only="${SAFE_COMMIT_CLF_WINS_ONLY}" \
+    +wmc_erc.safe_commit_clf_max_new_tokens="${SAFE_COMMIT_CLF_MAX_NEW}" \
     +wmc_erc.wmloss_add_coef="${WMLOSS_ADD_COEF}" \
     +wmc_erc.wmloss_add_use_entropy="${WMLOSS_ADD_USE_ENTROPY}" \
     +wmc_erc.wmloss_add_use_ema="${WMLOSS_ADD_USE_EMA}" \
@@ -270,8 +304,7 @@ exec env \
     +actor_rollout_ref.actor.hca_gamma="${HCA_GAMMA}" \
     +actor_rollout_ref.actor.hca_smooth_alpha="${HCA_SMOOTH_ALPHA}" \
     +actor_rollout_ref.actor.hca_z_threshold="${HCA_Z_THRESHOLD}" \
-    +actor_rollout_ref.actor.hca_action_only="${HCA_ACTION_ONLY}" \
-    +actor_rollout_ref.actor.hca_action_delimiter="${HCA_ACTION_DELIMITER}" \
+    +actor_rollout_ref.actor.hca_final_state_max_tokens="${HCA_FINAL_STATE_MAX_TOKENS}" \
     actor_rollout_ref.actor.world_model_coeff="${WMC_COEFF}" \
     actor_rollout_ref.actor.world_model.enable="${WM_ENABLE}" \
     actor_rollout_ref.actor.world_model.env_predict_prompt="${WM_ENV_PREDICT_PROMPT}" \

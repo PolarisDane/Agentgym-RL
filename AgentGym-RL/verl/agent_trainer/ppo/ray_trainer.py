@@ -39,6 +39,7 @@ from verl.agent_trainer.ppo.wmc_erc import (
     apply_value_baseline_redistribution,
     apply_hca_advantage,
     apply_ref_nll_add_advantage,
+    compute_turn_boundaries,
 )
 from verl.agent_trainer.ppo.world_model_loss import (
     DEFAULT_WORLD_MODEL_PROMPT,
@@ -583,10 +584,16 @@ class RayPPOTrainer(object):
         self.hca_gamma = float(_a.get('hca_gamma', 0.95))
         self.hca_smooth_alpha = float(_a.get('hca_smooth_alpha', 0.5))
         self.hca_z_threshold = float(_a.get('hca_z_threshold', 0.5))
-        # Score ρ on action-decision tokens only (after the delimiter), not the
-        # whole Thought+Action turn. Default OFF (= whole-turn scoring).
-        self.hca_action_only = bool(_a.get('hca_action_only', False))
-        self.hca_action_delimiter = str(_a.get('hca_action_delimiter', 'Action:'))
+
+        # Safe-commit TEXT gate (default OFF). When on, classify each scored turn's
+        # outcome predictability (text classifier) and AND it with low action-entropy
+        # to build the per-turn safe_commit_w consumed by clipping_method='safe_commit'.
+        _w = self.wmc_erc_config
+        self.safe_commit_text_gate = bool(_w.get('safe_commit_text_gate', False)) if _w else False
+        self.safe_commit_gate_mode = str(_w.get('safe_commit_gate_mode', 'and')) if _w else 'and'
+        self.safe_commit_clf_env = str(_w.get('safe_commit_clf_env', 'alfworld')) if _w else 'alfworld'
+        self.safe_commit_clf_max_new = int(_w.get('safe_commit_clf_max_new_tokens', 24)) if _w else 24
+        self.safe_commit_clf_wins_only = bool(_w.get('safe_commit_clf_wins_only', True)) if _w else True
 
         self._validate_config()
         self._create_dataloader()
@@ -953,6 +960,87 @@ class RayPPOTrainer(object):
                                                     prefix=logging_prefix)
         metrics.update(global_balance_stats)
 
+    def _compute_safe_commit_w(self, batch):
+        """Safe-commit TEXT gate (default OFF). Classify each scored turn's outcome
+        predictability via the policy (predict-first), AND it with low action-entropy
+        (group-relative), and write per-turn w_t∈[0,1] to non_tensor 'safe_commit_w',
+        consumed by clipping_method='safe_commit'. Fully guarded — any failure logs
+        and skips (safe_commit then falls back to its U-derived weight)."""
+        from verl.agent_trainer.ppo.safe_commit_gate import (
+            iter_action_turns, build_messages, combine_w,
+        )
+        metrics = {}
+        try:
+            if 'rollout_messages' not in batch.non_tensor_batch:
+                return {'safecommit_gate/skipped': 1.0}
+            msgs = batch.non_tensor_batch['rollout_messages']
+            uid = batch.non_tensor_batch['uid']
+            _, ginv = np.unique(uid, return_inverse=True)
+            response_mask = batch.batch['response_mask']
+            entropys = batch.batch['entropys']                       # (B, Tr) per-token entropy
+            B = response_mask.shape[0]
+            Tr = response_mask.shape[1]
+            tb = compute_turn_boundaries(response_mask)              # per-traj action spans
+            # per-traj win flag (GRPO advantage > 0) for wins-only classification
+            adv = batch.batch['advantages']
+            rm_b = response_mask.bool()
+            win = [bool(adv[i][rm_b[i]].mean().item() > 0) if rm_b[i].any() else False
+                   for i in range(B)]
+
+            # build classification prompts only for turns we will use
+            prompts, idx_map = [], []        # idx_map: (traj_i, turn_t)
+            ent_per_traj = [[] for _ in range(B)]
+            turns_per_traj = [0] * B
+            for i in range(B):
+                spans = tb[i]
+                turns_per_traj[i] = len(spans)
+                # per-turn mean action entropy
+                for (s, e) in spans:
+                    seg = entropys[i, s:e]
+                    ent_per_traj[i].append(float(seg.mean().item()) if e > s else None)
+                if self.safe_commit_clf_wins_only and not win[i]:
+                    continue
+                turns = iter_action_turns(list(msgs[i]))
+                for t, (hist, cur_obs, action) in enumerate(turns):
+                    if t >= len(spans):
+                        break
+                    prompts.append(build_messages(self.safe_commit_clf_env, hist, cur_obs, action))
+                    idx_map.append((i, t))
+
+            pred_per_traj = [[0] * turns_per_traj[i] for i in range(B)]
+            if prompts:
+                # tokenize (left-pad) → DataProto → dispatched generation+parse
+                ids_list = [self.tokenizer.apply_chat_template(m, add_generation_prompt=True,
+                                                               tokenize=True) for m in prompts]
+                K = max(len(x) for x in ids_list)
+                pad_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id
+                input_ids = torch.tensor([[pad_id] * (K - len(x)) + x for x in ids_list], dtype=torch.long)
+                attn = torch.tensor([[0] * (K - len(x)) + [1] * len(x) for x in ids_list], dtype=torch.long)
+                clf = DataProto.from_dict(tensors={'input_ids': input_ids, 'attention_mask': attn})
+                clf.meta_info['clf_max_new_tokens'] = self.safe_commit_clf_max_new
+                clf_p, n_pad = pad_dataproto_to_divisor(clf, self.actor_rollout_wg.world_size)
+                out = self.actor_rollout_wg.generate_classification(clf_p)
+                preds = out.batch['clf_predictable'][:len(idx_map)].tolist()
+                for (i, t), p in zip(idx_map, preds):
+                    pred_per_traj[i][t] = int(p)
+
+            w = combine_w(pred_per_traj, ent_per_traj, ginv.tolist(), gate=self.safe_commit_gate_mode)
+            w_arr = np.empty(B, dtype=object)
+            for i in range(B):
+                w_arr[i] = w[i]
+            batch.non_tensor_batch['safe_commit_w'] = w_arr
+
+            flat = [x for row in w for x in row]
+            metrics = {
+                'safecommit_gate/n_classified': float(len(idx_map)),
+                'safecommit_gate/frac_committed': float(np.mean([1.0 if x > 0 else 0.0 for x in flat])) if flat else 0.0,
+                'safecommit_gate/frac_predictable': float(np.mean([x for row in pred_per_traj for x in row])) if any(pred_per_traj) else 0.0,
+            }
+        except Exception as e:                                       # never break training
+            print(f'[safe_commit_text_gate] skipped due to: {e}')
+            metrics = {'safecommit_gate/error': 1.0}
+        return metrics
+
     def fit(self):
         """
         The training loop of PPO.
@@ -1148,9 +1236,6 @@ class RayPPOTrainer(object):
                                 gamma=self.hca_gamma,
                                 smooth_alpha=self.hca_smooth_alpha,
                                 success_threshold=self.hca_z_threshold,
-                                action_only=self.hca_action_only,
-                                tokenizer=self.tokenizer,
-                                action_delimiter=self.hca_action_delimiter,
                             )
                             batch.batch.pop('h_log_probs', None)
                             metrics.update(hca_metrics)
@@ -1163,6 +1248,14 @@ class RayPPOTrainer(object):
                                 batch=batch, wmc_erc_config=self.wmc_erc_config)
                             metrics.update(ref_nll_metrics)
                         elif self.wmc_erc_config and self.wmc_erc_config.get('enable', False) and 'entropys' in batch.batch.keys():
+                            # Optional TEXT gate (default OFF): classify per-turn
+                            # outcome predictability and AND with low action-entropy
+                            # → safe_commit_w, consumed by clipping_method=safe_commit.
+                            if (self.safe_commit_text_gate
+                                    and self.wmc_erc_config.get('clipping_method') == 'safe_commit'):
+                                with _timer('safe_commit_gate', timing_raw):
+                                    sc_metrics = self._compute_safe_commit_w(batch)
+                                metrics.update(sc_metrics)
                             batch, wmc_metrics = apply_wmc_erc(batch=batch,
                                                                entropys=batch.batch['entropys'],
                                                                wmc_erc_config=self.wmc_erc_config,

@@ -464,36 +464,36 @@ class DataParallelPPOActor(BasePPOActor):
         """
         return self.actor_module.get_output_embeddings()
 
-    def _outcome_z(self, traj_return: torch.Tensor) -> torch.Tensor:
-        """Binary outcome label: 1 if R > threshold else 0."""
-        return (traj_return > self.hca_z_threshold).long()
-
-    def _hindsight_forward_genver(self, micro_batch, temperature, z,
-                                  prefix_ids, prefix_mask):
+    def _hindsight_forward_genver(self, micro_batch, temperature):
         """Training-free Generative Verification (HCAPO §4.2).
 
-        Re-prompt the SAME frozen policy with the realized outcome injected as
-        a token prefix at the front of the context, then read off the policy's
-        own log-prob of the action tokens it actually produced. No head, no
-        gradient — this is pure inference with the policy weights.
+        Re-prompt the SAME frozen policy with the realized FINAL STATE injected
+        right BEFORE the response region, then read off the policy's own log-prob
+        of the action tokens it actually produced. No head, no gradient — pure
+        inference with the policy weights.
 
-        prefix_ids/prefix_mask: (num_z, K) outcome-statement token ids / mask,
-            indexed by the per-sample outcome label z. Left-padded to a common
-            length K so every sample in the batch grows by the same K tokens.
+        The hint (final-state hindsight) is inserted between the prompt and the
+        response: new = [prompt | hint | response]. The response tokens stay the
+        last `response_length`, so the action-token scoring tail-slice is
+        unchanged, while every action now attends to the outcome locally.
 
-        Returns: h_log_probs of shape (B, response_len) — log π(a_t | s_t, z).
+        Returns: h_log_probs of shape (B, response_len) — log π(a_t | s_t, s_final).
         """
         response_length = micro_batch['responses'].size(-1)
         input_ids = micro_batch['input_ids']
         attention_mask = micro_batch['attention_mask']
-        B = input_ids.size(0)
+        hint_ids = micro_batch['hca_hint_ids']                   # (B, K)
+        hint_mask = micro_batch['hca_hint_mask'].to(attention_mask.dtype)
 
-        pre_ids = prefix_ids[z]                                  # (B, K)
-        pre_mask = prefix_mask[z].to(attention_mask.dtype)       # (B, K)
-        new_input_ids = torch.cat([pre_ids, input_ids], dim=1)
-        new_attn = torch.cat([pre_mask, attention_mask], dim=1)
+        # split [prompt | response]; insert hint between them
+        prompt_ids = input_ids[:, :-response_length]
+        resp_ids = input_ids[:, -response_length:]
+        prompt_attn = attention_mask[:, :-response_length]
+        resp_attn = attention_mask[:, -response_length:]
+        new_input_ids = torch.cat([prompt_ids, hint_ids, resp_ids], dim=1)
+        new_attn = torch.cat([prompt_attn, hint_mask, resp_attn], dim=1)
         # Recompute position_ids from the augmented attention mask so RoPE sees
-        # the prefix→content order correctly regardless of original padding.
+        # the prompt→hint→response order correctly regardless of padding.
         new_pos = (new_attn.long().cumsum(dim=-1) - 1).clamp(min=0)
         new_pos = new_pos * new_attn.long()
 
@@ -518,8 +518,9 @@ class DataParallelPPOActor(BasePPOActor):
         every (sample, action token), under outcome-conditioned context. Used
         to form the hindsight importance ratio ρ = π_hind / π̄_hind.
 
-        Reads the outcome-statement prefixes from data.meta_info
-        ('hca_prefix_ids', 'hca_prefix_mask'), built by the worker tokenizer.
+        The per-trajectory final-state hint (data.batch['hca_hint_ids'/'..mask'],
+        built by the worker) is INSERTED right before the response region by the
+        genver forward, so each action attends to the realized outcome locally.
 
         Returns: h_log_probs tensor of shape (B, response_len) on CPU.
         """
@@ -528,11 +529,9 @@ class DataParallelPPOActor(BasePPOActor):
         micro_batch_size = data.meta_info['micro_batch_size']
         temperature = data.meta_info['temperature']
         use_dynamic_bsz = data.meta_info['use_dynamic_bsz']
-        dev = torch.cuda.current_device()
-        prefix_ids = data.meta_info['hca_prefix_ids'].to(dev)     # (num_z, K)
-        prefix_mask = data.meta_info['hca_prefix_mask'].to(dev)   # (num_z, K)
 
-        select_keys = ['responses', 'input_ids', 'attention_mask', 'position_ids', 'traj_return']
+        select_keys = ['responses', 'input_ids', 'attention_mask', 'position_ids',
+                       'hca_hint_ids', 'hca_hint_mask']
         batch = data.select(batch_keys=select_keys).batch
 
         if use_dynamic_bsz:
@@ -543,9 +542,7 @@ class DataParallelPPOActor(BasePPOActor):
 
         out_list = []
         for micro_batch in micro_batches:
-            z = self._outcome_z(micro_batch['traj_return']).to(device=dev)
-            h_lp = self._hindsight_forward_genver(
-                micro_batch, temperature, z, prefix_ids, prefix_mask)
+            h_lp = self._hindsight_forward_genver(micro_batch, temperature)
             out_list.append(h_lp.detach().cpu())
         h_log_probs = torch.concat(out_list, dim=0)
 

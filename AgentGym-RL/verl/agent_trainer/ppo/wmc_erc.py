@@ -45,40 +45,6 @@ def _turn_spans(mask_row: torch.Tensor):
             for a, b in zip(bounds[:-1], bounds[1:])]
 
 
-def _action_token_offsets(turn_ids, tokenizer, delimiter):
-    """Offsets (within a turn) of the action-content tokens: everything after
-    the LAST occurrence of ``delimiter`` in the decoded turn text.
-
-    Our assistant turns are ``Thought:\\n...\\n\\nAction:\\n<action>`` — the
-    paper (HCAPO §4.2) scores only the action decision, not the CoT reasoning.
-    This locates the action span via decode-bisection (robust to any tokenizer:
-    no dependency on the delimiter mapping to a fixed token-id subsequence).
-
-    Returns a list of int offsets, or None if the delimiter is absent (caller
-    then falls back to averaging over the whole turn).
-    """
-    n = len(turn_ids)
-    if n == 0:
-        return None
-    full = tokenizer.decode(turn_ids)
-    pos = full.rfind(delimiter)
-    if pos < 0:
-        return None
-    target = pos + len(delimiter)              # char index where the action begins
-    # smallest k in [0, n] with len(decode(turn_ids[:k])) > target
-    lo, hi = 0, n
-    while lo < hi:
-        mid = (lo + hi) // 2
-        if len(tokenizer.decode(turn_ids[:mid])) <= target:
-            lo = mid + 1
-        else:
-            hi = mid
-    start = max(lo - 1, 0)                      # token straddling the boundary
-    if start >= n:
-        return None
-    return list(range(start, n))
-
-
 def apply_hca_advantage(
     data,
     ratio_clip_min: float = 0.8,
@@ -88,9 +54,6 @@ def apply_hca_advantage(
     gamma: float = 0.95,
     smooth_alpha: float = 0.5,
     success_threshold: float = 0.5,
-    action_only: bool = False,
-    tokenizer=None,
-    action_delimiter: str = "Action:",
 ) -> Dict[str, float]:
     """HCAPO multi-scale advantage (arXiv:2603.08754, training-free).
 
@@ -126,14 +89,6 @@ def apply_hca_advantage(
     grp = torch.as_tensor(inverse, dtype=torch.long)            # (B,) group idx
     rm_bool = response_mask.to(torch.bool)
 
-    # Action-only ρ scoring: aggregate π_hind over just the action-decision
-    # tokens (after "Action:") instead of the whole Thought+Action turn, to
-    # match HCAPO §4.2 and stop the (longer) CoT from diluting the signal.
-    use_action_only = bool(action_only and tokenizer is not None
-                           and 'responses' in data.batch.keys())
-    responses = data.batch['responses'] if use_action_only else None
-    n_action_found = 0
-
     # ---- Pass 1: per-turn ρ and Q^H, scatter Q into a per-token tensor ----
     Q_tok = torch.zeros(B, T, dtype=dt, device=device)
     turn_q = []          # flat per-turn Q^H values
@@ -152,14 +107,11 @@ def apply_hca_advantage(
         # π_hind per turn (sharpened geometric mean of token probs)
         pi_hind = []
         for (s, e) in spans:
-            turn_lp = h_log_probs[i, s:e]
-            if use_action_only:
-                offs = _action_token_offsets(
-                    responses[i, s:e].tolist(), tokenizer, action_delimiter)
-                if offs:
-                    turn_lp = turn_lp[offs]
-                    n_action_found += 1
-            mean_logp = turn_lp.mean()
+            # π_hind over the whole assistant turn (Thought+Action). Action-only
+            # scoring was removed: in CoT agents the action string is a near-
+            # deterministic readout of the Thought (per-token logp≈0), so
+            # action-only flattens ρ — the hindsight signal lives in the Thought.
+            mean_logp = h_log_probs[i, s:e].mean()
             pi_hind.append(torch.exp(mean_logp / max(temp, 1e-6)))
         pi_hind = torch.stack(pi_hind)                          # (Ti,)
         pi_bar = pi_hind.mean().clamp(min=1e-8)
@@ -233,10 +185,6 @@ def apply_hca_advantage(
         'hca/turns_per_traj': float(n_turns_total / max(1, B)),
         'hca/z_success_frac': float((R > success_threshold).float().mean().item()),
     }
-    if use_action_only:
-        # Fraction of turns where the "Action:" delimiter was located (and ρ was
-        # thus scored on action-only tokens). Low ⇒ delimiter mismatch / fallback.
-        metrics['hca/action_only_found_frac'] = float(n_action_found / max(1, n_turns_total))
     return metrics
 
 
@@ -1435,6 +1383,234 @@ def apply_uncertainty_scale_advantage(
     return batch, metrics
 
 
+def apply_safe_commit_advantage(
+    batch, advantages, response_mask, turn_boundaries, h_wm_entropy,
+    s_star, wmc_erc_config, running_stats,
+):
+    """Safe-Commit Sharpener: boost advantage on turns that are SAFE to commit
+    (env outcome already determined), to accelerate commit speed — the opposite
+    sign of uncertainty_scale (which SHRINKS advantage on uncertain turns).
+    Empirically the curve gains come from committing FASTER where it is safe.
+
+    Theory anchor: a policy-gradient step reinforcing a_t changes entropy by
+    dH ≈ −A_t · s★_t, so a larger |A_t| ⇒ faster entropy descent (faster commit)
+    on turn t. We boost |A_t| on turns whose ENV OUTCOME is already determined.
+
+    Safe-to-commit weight w_t uses an EXOGENOUS gate (env determinism, NOT the
+    policy's own confidence), so there is no confidence→boost→more-confidence
+    feedback loop (the loop that makes s★/action-entropy boosting collapse — the
+    HCA ω=1.0 over-fit):
+
+        w_t = clip(1 − U_t / U_group, 0, 1)              # low env-entropy ⇒ safe ⇒ w→1
+
+    U_t = mean env-token entropy of the obs FOLLOWING a_t; U_group / w̄_group /
+    σ_w_group are statistics over the GRPO GROUP (uid = same prompt = same env),
+    removing between-task scale.
+
+    Two modes (safe_commit_mode):
+
+    • "add" (DEFAULT) — additive, structurally identical to HCAPO's multi-scale
+      advantage so its magnitude matches HCA at ω=1.0 (HCA logged A_micro_abs_mean
+      ≈0.49, mean≈+0.24-0.37). Replaces HCA's noise-dominated hindsight ρ with the
+      exogenous safe weight:
+          A_safe_t = (w_t − w̄_group) / (σ_w_group + ε)    # group-norm ⇒ ~unit std
+          do-no-harm: zero A_safe on negatives, applied only to WINNING trajectories
+          A'_{i,t} = A_GRPO_{i,t} + ω · A_safe_t           # action tokens
+      ω = safe_commit_omega is the direct magnitude dial (ω=1.0 ≈ HCA scale; lower
+      ω ⇒ smaller added advantage). "Win" = trajectory A_GRPO > success_threshold.
+      Gating to wins mirrors HCA's Q^H ∝ R (failures get no micro signal).
+
+    • "redistribute" — multiplicative, mean-preserving sharpener (trajectory
+      UNBIASED, adds NO net magnitude):
+          g_t = clip(1 + κ·(w_t − w̄_group), g_min, g_max) ; A'_{i,t} = g_t · A_{i,t}
+      with safe_commit_renormalize (default True) restoring each group's Σ|A|.
+
+    Semantic-label injection (both modes): if batch.non_tensor_batch carries
+    'safe_commit_w' (object array; per-traj list of per-turn weights in [0,1],
+    1.0=text-classified DETERMINISTIC, 0.0=REVEALING) it OVERRIDES the U-derived
+    w_t. Turns with no valid signal (U_t<=0, no label) are neutral. Gated by
+    clipping_method == "safe_commit".
+    """
+    mode = str(wmc_erc_config.get("safe_commit_mode", "add"))
+    omega = float(wmc_erc_config.get("safe_commit_omega", 1.0))
+    success_threshold = float(wmc_erc_config.get("safe_commit_success_threshold", 0.0))
+    # γ-recency tilt (add mode; default 0 = OFF = pure content targeting). The case
+    # study showed the OLD HCA's speed came from a content-blind γ^{T-1-t} recency
+    # ramp (corr 0.87 with turn position). This optionally re-introduces that
+    # "reward the successful end-game" prior WHILE keeping the low-U content target:
+    #   A_safe_t *= (1 + λ · γ^{T-1-t})    (last turn → ×(1+λ); earlier decays)
+    recency = float(wmc_erc_config.get("safe_commit_recency", 0.0))
+    recency_gamma = float(wmc_erc_config.get("safe_commit_recency_gamma", 0.95))
+    kappa = float(wmc_erc_config.get("safe_commit_kappa", 1.0))
+    g_max = float(wmc_erc_config.get("safe_commit_gmax", 2.0))
+    g_min = float(wmc_erc_config.get("safe_commit_gmin", 0.5))
+    renormalize = bool(wmc_erc_config.get("safe_commit_renormalize", True))
+
+    B = advantages.shape[0]
+    uid = batch.non_tensor_batch['uid']
+    _, ginv = np.unique(uid, return_inverse=True)                 # group index per traj
+    # optional semantic safe-weight injection (text classifier): per-traj list of
+    # per-turn weights in [0,1]; overrides the U-derived weight when present.
+    label_w = None
+    if hasattr(batch, "non_tensor_batch"):
+        label_w = batch.non_tensor_batch.get("safe_commit_w", None)
+
+    # pass 1: gather U_t / optional label per turn; per-group positive-U means
+    raw = []                                                      # (i,start,end,g,U_t,lab_w,t,Ti)
+    grp_u = defaultdict(list); glob_u = []
+    for i in range(B):
+        g = int(ginv[i])
+        Ti = len(turn_boundaries[i])
+        for t, (start, end) in enumerate(turn_boundaries[i]):
+            U_t = h_wm_entropy[i][t].item()
+            lw = None
+            if label_w is not None:
+                try:
+                    lw = float(label_w[i][t])
+                except Exception:
+                    lw = None
+            raw.append((i, start, end, g, U_t, lw, t, Ti))
+            if U_t > 0.0:
+                grp_u[g].append(U_t); glob_u.append(U_t)
+    glob_u_mean = float(np.mean(glob_u)) if glob_u else 1.0
+    mu_u = {g: float(np.mean(v)) for g, v in grp_u.items()}       # per-group env-entropy mean
+
+    # pass 2: per-turn safe-commit weight w_t ∈ [0,1] (label overrides U); group means of w
+    turn_info = []                                                # (i,start,end,g,w_or_None,t,Ti)
+    grp_w = defaultdict(list)
+    for (i, start, end, g, U_t, lw, t, Ti) in raw:
+        if lw is not None:
+            w = min(1.0, max(0.0, lw))
+        elif U_t > 0.0:
+            denom_u = max(mu_u.get(g, glob_u_mean), 1e-6)         # fallback: batch-global
+            w = min(1.0, max(0.0, 1.0 - U_t / denom_u))
+        else:
+            w = None                                             # no signal → neutral (g=1)
+        turn_info.append((i, start, end, g, w, t, Ti))
+        if w is not None:
+            grp_w[g].append(w)
+    mu_w = {g: float(np.mean(v)) for g, v in grp_w.items()}
+    sigma_w = {g: float(np.std(v)) for g, v in grp_w.items()}     # per-group w spread (add mode)
+
+    # per-trajectory "win" flag = trajectory A_GRPO > threshold (advantages are the
+    # GRPO scalar broadcast at entry, constant over a trajectory's action tokens).
+    rm_bool = response_mask.to(torch.bool)
+    win = {}
+    for i in range(B):
+        m = rm_bool[i]
+        win[i] = (float(advantages[i][m].mean().item()) > success_threshold) if m.any() else False
+
+    metrics: Dict[str, float] = {
+        "wmc_erc/safecommit_active": 1.0,
+        "wmc_erc/safecommit_mode_add": 1.0 if mode == "add" else 0.0,
+        "wmc_erc/safecommit_used_label": 1.0 if label_w is not None else 0.0,
+        "wmc_erc/safecommit_n_groups": float(len(mu_w)),
+        "wmc_erc/safecommit_w_mean": (
+            float(np.mean([w for v in grp_w.values() for w in v])) if grp_w else 0.0
+        ),
+    }
+
+    if mode == "add":
+        # HCA-structured additive boost: A' = A_GRPO + ω · A_safe, where A_safe is
+        # the GROUP-normalized safe weight (so it is ~unit std like HCA's A_micro,
+        # making ω the magnitude dial; ω=1.0 ≈ HCA's 0.49 abs / +0.3 mean). Apply
+        # only on winning trajectories, do-no-harm (no negative add). ω = the knob.
+        # pass A: per-turn base boost a_safe (do-no-harm, wins only) + recency multiplier
+        boost = []                                                # (i,start,end, a_safe, mult)
+        per_i_num = defaultdict(float)                            # Σ a_safe·mult  (per traj)
+        per_i_den = defaultdict(float)                            # Σ a_safe       (per traj)
+        for (i, start, end, g, w, t_idx, Ti) in turn_info:
+            if w is None or not win[i]:
+                continue
+            sd = sigma_w.get(g, 0.0)
+            if sd < 1e-6:
+                continue                                          # no within-group spread
+            a_safe = (w - mu_w.get(g, w)) / (sd + 1e-6)
+            if a_safe < 0.0:
+                a_safe = 0.0                                      # do-no-harm
+            mult = (1.0 + recency * (recency_gamma ** max(0, Ti - 1 - t_idx))) if recency > 0.0 else 1.0
+            boost.append((i, start, end, a_safe, mult))
+            per_i_num[i] += a_safe * mult
+            per_i_den[i] += a_safe
+        # pass B: γ-recency is a PURE TILT — normalize the multiplier per trajectory so
+        # the total added boost per trajectory is UNCHANGED by λ (Σ a_safe·mult_norm =
+        # Σ a_safe). This decouples recency (where the boost goes) from ω (how much is
+        # added), so raising λ no longer inflates magnitude / collapses entropy.
+        added = []
+        for (i, start, end, a_safe, mult) in boost:
+            if recency > 0.0 and per_i_num[i] > 1e-8:
+                Z = per_i_num[i] / max(per_i_den[i], 1e-8)        # a_safe-weighted mean mult
+                a_eff = a_safe * (mult / Z)
+            else:
+                a_eff = a_safe
+            delta = omega * a_eff
+            advantages[i, start:end] = advantages[i, start:end] + delta
+            added.append(delta)
+        batch.batch["advantages"] = advantages
+        metrics["wmc_erc/safecommit_omega"] = omega
+        metrics["wmc_erc/safecommit_recency"] = recency
+        if added:
+            arr = np.array(added)
+            metrics.update({
+                "wmc_erc/safecommit_add_abs_mean": float(np.abs(arr).mean()),
+                "wmc_erc/safecommit_add_mean": float(arr.mean()),
+                "wmc_erc/safecommit_add_max": float(arr.max()),
+                "wmc_erc/safecommit_add_nonzero_frac": float((arr > 1e-6).mean()),
+            })
+        return batch, metrics
+
+    # mode == "redistribute": multiplicative, mean-preserving sharpener.
+    all_g = []
+    grp_orig_mass = defaultdict(float)                           # Σ|A| per group BEFORE
+    grp_new_mass = defaultdict(float)                            # Σ|A| per group AFTER
+    for (i, start, end, g, w, _t, _Ti) in turn_info:
+        if w is None:
+            gt = 1.0
+        else:
+            wbar = mu_w.get(g, w)
+            gt = 1.0 + kappa * (w - wbar)
+            gt = min(g_max, max(g_min, gt))
+        seg = advantages[i, start:end]
+        orig_abs = float(seg.abs().sum().item())
+        grp_orig_mass[g] += orig_abs
+        grp_new_mass[g] += orig_abs * gt                        # gt>0 ⇒ |scaled|=|orig|·gt
+        advantages[i, start:end] = seg * gt
+        all_g.append(gt)
+
+    # renormalize: restore each GROUP's total |advantage| so the booster is a pure
+    # mean-preserving REDISTRIBUTION toward safe turns (trajectory-level unbiased).
+    renorm_ratios = []
+    if renormalize:
+        grp_ratio = {}
+        for g in grp_orig_mass:
+            nm = grp_new_mass[g]
+            grp_ratio[g] = (grp_orig_mass[g] / nm) if nm > 1e-8 else 1.0
+            renorm_ratios.append(grp_ratio[g])
+        for (i, start, end, g, w, _t, _Ti) in turn_info:
+            r = grp_ratio.get(g, 1.0)
+            if r != 1.0:
+                advantages[i, start:end] = advantages[i, start:end] * r
+    batch.batch["advantages"] = advantages
+
+    metrics.update({
+        "wmc_erc/safecommit_kappa": kappa,
+        "wmc_erc/safecommit_gmax": g_max,
+        "wmc_erc/safecommit_gmin": g_min,
+        "wmc_erc/safecommit_renormalize": 1.0 if renormalize else 0.0,
+    })
+    if renorm_ratios:
+        metrics["wmc_erc/safecommit_renorm_ratio_mean"] = float(np.mean(renorm_ratios))
+    if all_g:
+        arr = np.array(all_g)
+        metrics.update({
+            "wmc_erc/safecommit_g_mean": float(arr.mean()),
+            "wmc_erc/safecommit_g_max": float(arr.max()),
+            "wmc_erc/safecommit_g_min": float(arr.min()),
+            "wmc_erc/safecommit_frac_boosted": float((arr > 1.01).mean()),
+        })
+    return batch, metrics
+
+
 def apply_wmc_erc(
     batch,
     entropys: torch.Tensor,
@@ -1515,6 +1691,21 @@ def apply_wmc_erc(
     # unpredictable-outcome turns. Scales symmetrically; no renormalization.
     if clipping_method == "uncertainty_scale":
         return apply_uncertainty_scale_advantage(
+            batch=batch,
+            advantages=advantages,
+            response_mask=response_mask,
+            turn_boundaries=turn_boundaries,
+            h_wm_entropy=h_wm_entropy,
+            s_star=s_star,
+            wmc_erc_config=wmc_erc_config,
+            running_stats=running_stats,
+        )
+
+    # Safe-Commit Sharpener: AMPLIFY advantage on safe-to-commit (env-deterministic
+    # / low next-obs entropy) turns to accelerate commit there. Opposite sign of
+    # uncertainty_scale; mean-preserving (renormalized) ⇒ trajectory-unbiased.
+    if clipping_method == "safe_commit":
+        return apply_safe_commit_advantage(
             batch=batch,
             advantages=advantages,
             response_mask=response_mask,
