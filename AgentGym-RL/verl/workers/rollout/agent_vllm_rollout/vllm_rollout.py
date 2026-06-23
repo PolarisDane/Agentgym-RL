@@ -217,13 +217,15 @@ class vLLMRollout(BaseRollout):
         try:
             sp = SamplingParams(n=1, temperature=0.0, top_p=1.0, top_k=-1,
                                 max_tokens=int(max_new_tokens))
-            outs = self.inference_engine.generate(
+            output = self.inference_engine.generate(
                 prompts=None, prompt_token_ids=list(prompt_token_ids),
                 sampling_params=sp, use_tqdm=False)
-            texts = []
-            for o in outs:
-                ids = o.outputs[0].token_ids if hasattr(o, "outputs") else o
-                texts.append(self.tokenizer.decode(list(ids), skip_special_tokens=True))
+            # verl's vLLM wrapper returns the response-token tensor as output[0]
+            # (same as generate_sequences: response_ids = output[0].tolist()), a
+            # (num_prompts, resp_len) tensor — NOT a list of vLLM RequestOutput.
+            resp = output[0] if isinstance(output, (tuple, list)) else output
+            resp_ids = resp.tolist() if hasattr(resp, "tolist") else list(resp)
+            texts = [self.tokenizer.decode(r, skip_special_tokens=True) for r in resp_ids]
         finally:
             if self.config.free_cache_engine:
                 self.inference_engine.free_cache_engine()

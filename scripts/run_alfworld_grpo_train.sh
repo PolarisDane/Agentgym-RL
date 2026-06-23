@@ -54,7 +54,7 @@ MAX_TOKENS_PER_TURN="${MAX_TOKENS_PER_TURN:-512}"
 ROLLOUT_GPU_MEMORY_UTILIZATION="${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.80}"
 SAVE_FREQ="${SAVE_FREQ:-25}"
 
-ENABLE_ERC="${ENABLE_ERC:-1}"
+ENABLE_ERC="${ENABLE_ERC:-0}"
 ERC_MU_BASE="${ERC_MU_BASE:-1.0}"
 ERC_MU_EXP="${ERC_MU_EXP:-1.5}"
 ERC_ETA_WM="${ERC_ETA_WM:-2.0}"
@@ -152,23 +152,6 @@ if [[ "${ENABLE_ERC}" == "1" ]]; then
   ERC_ENABLE_VALUE="True"
 fi
 
-# GRPO state-value baseline (turn-level redistribution). Default OFF; when
-# disabled all of these env vars are no-ops and code behavior is identical
-# to plain GRPO. When ON, a small value head is attached to the actor
-# backbone, V(s_t) is read at the position right before the first action
-# token of every turn, and the scalar GRPO advantage is redistributed as
-# A_t = Â − β·(V̂_t − mean_t V̂_t) (trajectory mean preserved).
-USE_VALUE_BASELINE="${USE_VALUE_BASELINE:-False}"
-VALUE_LOSS_COEF="${VALUE_LOSS_COEF:-0.5}"
-VALUE_BASELINE_BETA="${VALUE_BASELINE_BETA:-0.5}"
-# Linear warmup on β: β_eff = β · min(1, step / warmup). Default 20 steps
-# covers the empirically noisy-V window (step 8-24 in the 5.31 alfworld run).
-VALUE_BASELINE_BETA_WARMUP_STEPS="${VALUE_BASELINE_BETA_WARMUP_STEPS:-20}"
-VALUE_HEAD_MID_RATIO="${VALUE_HEAD_MID_RATIO:-4}"
-# Independent lr for value_head params. Lowered from 1e-3 to 5e-4 because
-# 1e-3 made V wander noisily (V_mean swung -0.13 to +1.0 across steps 8-24
-# while chasing per-batch R variance), feeding noise into redistribution.
-VALUE_HEAD_LR="${VALUE_HEAD_LR:-5e-4}"
 
 # Hindsight Credit Assignment (HCAPO, arXiv:2603.08754) — training-free
 # generative verification: re-prompt the frozen policy with the realized
@@ -179,17 +162,42 @@ USE_HINDSIGHT_HCA="${USE_HINDSIGHT_HCA:-False}"
 HCA_RATIO_CLIP_MIN="${HCA_RATIO_CLIP_MIN:-0.8}"
 HCA_RATIO_CLIP_MAX="${HCA_RATIO_CLIP_MAX:-1.2}"
 # Sharpening temperature T_temp in pi_hind = exp(mean_log_p / T_temp).
-HCA_TEMP="${HCA_TEMP:-5.0}"
+HCA_TEMP="${HCA_TEMP:-2.0}"
 # Weight of the micro (hindsight) advantage added to the GRPO macro advantage.
 HCA_OMEGA="${HCA_OMEGA:-1.0}"
 # Discount for the per-turn return G_t = gamma^{T-1-t} * R.
-HCA_GAMMA="${HCA_GAMMA:-0.95}"
+HCA_GAMMA="${HCA_GAMMA:-1.0}"
 # Temporal smoothing Q_t = a*Q_t + (1-a)*Q_{t+1}; set 1.0 to disable.
 HCA_SMOOTH_ALPHA="${HCA_SMOOTH_ALPHA:-0.5}"
 # Reward threshold to label success (binary R in {0,1} => 0.5).
 HCA_Z_THRESHOLD="${HCA_Z_THRESHOLD:-0.5}"
 # Max tokens of the realized FINAL STATE injected as hindsight (env-agnostic).
 HCA_FINAL_STATE_MAX_TOKENS="${HCA_FINAL_STATE_MAX_TOKENS:-96}"
+# HCAPO-aligned per-step LOCAL injection (paper §4.2). OFF=old front-once (no signal);
+# ON=reconstruct truncated per-step prompts (history_len) so pi_hind carries hindsight.
+HCA_PERSTEP="${HCA_PERSTEP:-True}"
+HCA_HISTORY_LEN="${HCA_HISTORY_LEN:-0}"   # 0 = FULL history (consistent with our impl); >0 = paper truncation
+# Progress/Exploration credit (DEFAULT OFF): classify P/E steps per traj, add all-positive
+# advantage (omega_p on progress > omega_e on exploration; P/E overlap -> P; wins only).
+PE_CREDIT_ENABLE="${PE_CREDIT_ENABLE:-False}"
+PE_OMEGA_PROGRESS="${PE_OMEGA_PROGRESS:-1.0}"
+PE_OMEGA_EXPLORE="${PE_OMEGA_EXPLORE:-0.4}"
+PE_CREDIT_WINS_ONLY="${PE_CREDIT_WINS_ONLY:-True}"
+PE_CLF_ENV="${PE_CLF_ENV:-alfworld}"
+# Plan-forecast auxiliary SFT (DEFAULT OFF): each step predict the realized next-K
+# action commands (current included). Separate forward, CE loss * coef, no PG.
+# gate=wins -> only winning trajectories; gate=all -> every trajectory.
+PLAN_FORECAST_ENABLE="${PLAN_FORECAST_ENABLE:-True}"
+PLAN_FORECAST_COEF="${PLAN_FORECAST_COEF:-0.01}"
+PLAN_FORECAST_K="${PLAN_FORECAST_K:-3}"
+PLAN_FORECAST_GATE="${PLAN_FORECAST_GATE:-wins}"
+PLAN_FORECAST_SUCCESS_THRESHOLD="${PLAN_FORECAST_SUCCESS_THRESHOLD:-0.5}"
+PLAN_FORECAST_MAX_LENGTH="${PLAN_FORECAST_MAX_LENGTH:-4096}"
+# Block 1 (inline plan, DEFAULT OFF): append a standing instruction so the model
+# writes its next-K-action plan inside the THOUGHT each turn (auto-eats PG, the
+# env still parses Action:). Pairs with block 2 (plan_forecast) — same K/framing.
+PLAN_INLINE_ENABLE="${PLAN_INLINE_ENABLE:-True}"
+PLAN_INLINE_K="${PLAN_INLINE_K:-${PLAN_FORECAST_K}}"
 # HCA action-only ρ scoring: score on the action tokens (after the
 # delimiter) instead of the whole Thought+Action turn. Default OFF.
 
@@ -251,6 +259,8 @@ exec env \
     data.train_batch_size="${TRAIN_BATCH_SIZE}" \
     data.max_prompt_length="${MAX_PROMPT_LENGTH}" \
     data.max_response_length="${MAX_RESPONSE_LENGTH}" \
+    +data.plan_inline_enable="${PLAN_INLINE_ENABLE}" \
+    +data.plan_inline_k="${PLAN_INLINE_K}" \
     actor_rollout_ref.agentgym.task_name="${TASK_NAME}" \
     actor_rollout_ref.agentgym.env_addr="'${ENV_ADDR}'" \
     actor_rollout_ref.agentgym.timeout=2400 \
@@ -330,12 +340,6 @@ exec env \
     +wmc_erc.epi_intrinsic_coef="${EPI_INTRINSIC_COEF}" \
     +wmc_erc.epi_intrinsic_cap="${EPI_INTRINSIC_CAP}" \
     +wmc_erc.epi_intrinsic_use_ref="${EPI_INTRINSIC_USE_REF}" \
-    +actor_rollout_ref.actor.use_value_baseline="${USE_VALUE_BASELINE}" \
-    +actor_rollout_ref.actor.value_loss_coef="${VALUE_LOSS_COEF}" \
-    +actor_rollout_ref.actor.value_baseline_beta="${VALUE_BASELINE_BETA}" \
-    +actor_rollout_ref.actor.value_baseline_beta_warmup_steps="${VALUE_BASELINE_BETA_WARMUP_STEPS}" \
-    +actor_rollout_ref.actor.value_head_mid_ratio="${VALUE_HEAD_MID_RATIO}" \
-    +actor_rollout_ref.actor.value_head_lr="${VALUE_HEAD_LR}" \
     +actor_rollout_ref.actor.use_hindsight_hca="${USE_HINDSIGHT_HCA}" \
     +actor_rollout_ref.actor.hca_ratio_clip_min="${HCA_RATIO_CLIP_MIN}" \
     +actor_rollout_ref.actor.hca_ratio_clip_max="${HCA_RATIO_CLIP_MAX}" \
@@ -345,6 +349,19 @@ exec env \
     +actor_rollout_ref.actor.hca_smooth_alpha="${HCA_SMOOTH_ALPHA}" \
     +actor_rollout_ref.actor.hca_z_threshold="${HCA_Z_THRESHOLD}" \
     +actor_rollout_ref.actor.hca_final_state_max_tokens="${HCA_FINAL_STATE_MAX_TOKENS}" \
+    +actor_rollout_ref.actor.hca_perstep="${HCA_PERSTEP}" \
+    +actor_rollout_ref.actor.hca_history_len="${HCA_HISTORY_LEN}" \
+    +actor_rollout_ref.actor.pe_credit_enable="${PE_CREDIT_ENABLE}" \
+    +actor_rollout_ref.actor.pe_omega_progress="${PE_OMEGA_PROGRESS}" \
+    +actor_rollout_ref.actor.pe_omega_explore="${PE_OMEGA_EXPLORE}" \
+    +actor_rollout_ref.actor.pe_credit_wins_only="${PE_CREDIT_WINS_ONLY}" \
+    +actor_rollout_ref.actor.pe_clf_env="${PE_CLF_ENV}" \
+    +actor_rollout_ref.actor.plan_forecast_enable="${PLAN_FORECAST_ENABLE}" \
+    +actor_rollout_ref.actor.plan_forecast_coef="${PLAN_FORECAST_COEF}" \
+    +actor_rollout_ref.actor.plan_forecast_k="${PLAN_FORECAST_K}" \
+    +actor_rollout_ref.actor.plan_forecast_gate="${PLAN_FORECAST_GATE}" \
+    +actor_rollout_ref.actor.plan_forecast_success_threshold="${PLAN_FORECAST_SUCCESS_THRESHOLD}" \
+    +actor_rollout_ref.actor.plan_forecast_max_length="${PLAN_FORECAST_MAX_LENGTH}" \
     actor_rollout_ref.actor.world_model_coeff="${WMC_COEFF}" \
     actor_rollout_ref.actor.world_model.enable="${WM_ENABLE}" \
     actor_rollout_ref.actor.world_model.env_predict_prompt="${WM_ENV_PREDICT_PROMPT}" \

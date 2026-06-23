@@ -90,6 +90,10 @@ class RLHFDataset(Dataset):
         self.chat_template_func = data_config.get("chat_template_func", None)
         self.need_tools_kwargs = data_config.get("need_tools_kwargs", False)
         self.filter_prompts = data_config.get("filter_prompts", True)
+        # Block-1 inline plan: append a standing "plan the next K actions inside
+        # your THOUGHT" instruction to the task instruction. Default OFF.
+        self.plan_inline_enable = bool(data_config.get("plan_inline_enable", False))
+        self.plan_inline_k = int(data_config.get("plan_inline_k", 3))
         self.serialize_dataset = False
         self._read_files_and_tokenize()
         # get agentgym client
@@ -112,9 +116,14 @@ class RLHFDataset(Dataset):
 
     def _build_messages(self, example: dict):
         example["data_source"] = example[self.prompt_key].split("_")[0]
-        messages = [{"role": "user", "content": self.env_client.conversation_start[0]["value"]},
-                     {"role": "assistant", "content": self.env_client.conversation_start[1]["value"]}]
-        prompt_with_chat_template = "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\n" + self.env_client.conversation_start[0]["value"] + "<|im_end|>\n<|im_start|>assistant\n" + self.env_client.conversation_start[1]["value"] + "<|im_end|>"
+        instruction = self.env_client.conversation_start[0]["value"]
+        if self.plan_inline_enable:
+            from verl.agent_trainer.ppo.plan_forecast import inline_plan_instruction
+            instruction = instruction + inline_plan_instruction(self.plan_inline_k)
+        ack = self.env_client.conversation_start[1]["value"]
+        messages = [{"role": "user", "content": instruction},
+                     {"role": "assistant", "content": ack}]
+        prompt_with_chat_template = "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\n" + instruction + "<|im_end|>\n<|im_start|>assistant\n" + ack + "<|im_end|>"
         return messages, prompt_with_chat_template
 
     def __getitem__(self, item):

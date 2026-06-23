@@ -188,53 +188,6 @@ def apply_hca_advantage(
     return metrics
 
 
-def apply_value_baseline_redistribution(
-    data,
-    beta: float,
-) -> Dict[str, float]:
-    """Redistribute the GRPO scalar advantage across turns via V̂(s_t).
-
-    Given GRPO's per-trajectory scalar Â (broadcast to every action token in
-    ``data.batch['advantages']``) and per-turn state values stored in
-    ``state_values`` / ``state_values_mask``, replace each action token's
-    advantage with::
-
-        A_t = Â  −  β · (V̂_t  −  mean_t V̂_t)
-
-    Broadcast to all action tokens in turn t. Because mean_t (V̂_t − meanV)=0
-    over a single trajectory, the per-trajectory mean is preserved at Â.
-    """
-    advantages = data.batch['advantages']  # (B, response_len)
-    response_mask = data.batch['response_mask']
-    state_values = data.batch['state_values'].to(advantages.dtype)  # (B, max_turns)
-    sv_mask = data.batch['state_values_mask'].to(advantages.dtype)  # (B, max_turns)
-
-    B = advantages.size(0)
-    n_valid = sv_mask.sum(-1).clamp(min=1.0)
-    mean_V = (state_values * sv_mask).sum(-1) / n_valid  # (B,)
-    delta = (state_values - mean_V.unsqueeze(-1)) * sv_mask  # (B, max_turns)
-
-    # Build per-token turn id (0-indexed within sample).
-    boundaries_per_sample = compute_turn_boundaries(response_mask)
-    new_adv = advantages.clone()
-    for i in range(B):
-        boundaries = boundaries_per_sample[i]
-        for t, (start, end) in enumerate(boundaries):
-            if t >= delta.size(1):
-                break
-            d = delta[i, t]
-            new_adv[i, start:end] = advantages[i, start:end] - beta * d
-    new_adv = new_adv * response_mask.to(new_adv.dtype)
-    data.batch['advantages'] = new_adv
-
-    metrics = {
-        'value_baseline/delta_abs_mean': delta.abs().mean().item(),
-        'value_baseline/V_mean': mean_V.mean().item(),
-        'value_baseline/n_valid_turns_mean': n_valid.mean().item(),
-    }
-    return metrics
-
-
 def compute_turn_boundaries(response_mask: torch.Tensor) -> List[List[Tuple[int, int]]]:
     """Extract contiguous assistant-token spans from response_mask.
 

@@ -479,6 +479,50 @@ class ActorRolloutRefWorker(Worker):
         return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    def update_actor_plan_forecast(self, data: DataProto):
+        """One plan-forecast SFT update (predict realized next-K actions).
+
+        Incoming ``data`` is the output of ``plan_forecast.build_plan_forecast_batch``
+        (expects ``input_ids``/``attention_mask``/``position_ids``/``loss_mask``).
+        Mirrors ``update_actor_world_model``; DP dispatch + caller-side
+        ``pad_dataproto_to_divisor`` keep every rank's sample count equal, so no
+        FSDP collective desync.
+        """
+        data = data.to('cuda')
+
+        assert self._is_actor
+        if self._is_offload_param:
+            load_fsdp_param_and_grad(module=self.actor_module_fsdp,
+                                     device_id=torch.cuda.current_device(),
+                                     load_grad=self._is_offload_grad)
+        if self._is_offload_optimizer:
+            load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=torch.cuda.current_device())
+
+        data.batch = data.batch.cuda()
+        log_gpu_memory_usage('Before update plan-forecast', logger=logger)
+
+        with self.ulysses_sharding_manager:
+            data = self.ulysses_sharding_manager.preprocess_data(data=data)
+            with Timer(name='update_plan_forecast', logger=None) as timer:
+                metrics = self.actor.update_plan_forecast(data=data)
+            metrics['plan_forecast/step_time'] = timer.last
+
+            self.actor_lr_scheduler.step()
+            metrics['plan_forecast/lr'] = self.actor_lr_scheduler.get_last_lr()[0]
+
+            log_gpu_memory_usage('After update plan-forecast', logger=logger)
+            output = DataProto(meta_info={'metrics': metrics})
+            output = self.ulysses_sharding_manager.postprocess_data(data=output)
+            output = output.to('cpu')
+
+        if self._is_offload_param:
+            offload_fsdp_param_and_grad(module=self.actor_module_fsdp, offload_grad=self._is_offload_grad)
+        if self._is_offload_optimizer:
+            offload_fsdp_optimizer(optimizer=self.actor_optimizer)
+        torch.cuda.empty_cache()
+        return output
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def generate_sequences(self, prompts: DataProto):
         prompts = prompts.to('cuda')
 
@@ -516,6 +560,150 @@ class ActorRolloutRefWorker(Worker):
         # clear kv cache
         torch.cuda.empty_cache()
         log_gpu_memory_usage('After recompute log prob', logger=logger)
+        return output
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    def compute_hindsight_log_probs_perstep(self, data: DataProto):
+        """HCAPO-aligned PER-STEP hindsight scoring (paper §4.2). Instead of one
+        front injection over the whole concatenated trajectory (cancelled by ÷π̄),
+        reconstruct a SHORT per-step prompt (truncated history + current obs +
+        s_final) LOCAL to each action and read its mean action-token log-prob. The
+        scalar is broadcast back into the (B,T) h_log_probs layout, so downstream
+        apply_hca_advantage is unchanged. Enabled by actor.hca_perstep."""
+        from verl.agent_trainer.ppo.hca_perstep import iter_step_inputs
+        from verl.agent_trainer.ppo.wmc_erc import _turn_spans
+        assert self._is_actor
+        if self._is_offload_param:
+            load_fsdp_param_and_grad(module=self.actor_module_fsdp,
+                                     device_id=torch.cuda.current_device(),
+                                     load_grad=self._is_offload_grad)
+        H = int(self.config.actor.get('hca_history_len', 0))   # 0 = full history (our impl), >0 = paper truncation
+        temperature = self.config.rollout.temperature
+        messages = data.non_tensor_batch['rollout_messages']
+        response_mask = data.batch['response_mask']
+        B, T = response_mask.shape
+        pad_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id
+        h_log_probs = torch.zeros(B, T, dtype=torch.float32)
+
+        # build all per-step sequences for this shard
+        seqs, amasks, locs = [], [], []          # token-id list, action-mask list, (traj, span)
+        spans_per_traj = []
+        for i in range(B):
+            spans = _turn_spans(response_mask[i].to(torch.bool))
+            spans_per_traj.append(spans)
+            steps = iter_step_inputs(list(messages[i]), history_len=H)
+            for k, (ctx_msgs, action_text) in enumerate(steps):
+                if k >= len(spans):
+                    break
+                try:
+                    ctx_ids = self.tokenizer.apply_chat_template(ctx_msgs, add_generation_prompt=True, tokenize=True)
+                    full_ids = self.tokenizer.apply_chat_template(
+                        ctx_msgs + [{"role": "assistant", "content": action_text}],
+                        add_generation_prompt=False, tokenize=True)
+                except Exception:
+                    continue
+                if len(full_ids) <= len(ctx_ids) or len(full_ids) > 2048:
+                    continue
+                am = [0] * len(ctx_ids) + [1] * (len(full_ids) - len(ctx_ids))
+                seqs.append(full_ids); amasks.append(am); locs.append((i, spans[k]))
+
+        # forward in chunks, scatter mean action logp back into h_log_probs[i, s:e].
+        # CRITICAL: every rank MUST run the SAME number of FSDP forwards or the
+        # per-layer all-gather collectives desync and deadlock (NCCL timeout) —
+        # variable trajectory turn counts give variable chunk counts per rank. So
+        # we all-reduce the max chunk count and pad short ranks with dummy forwards.
+        CH = 16
+        local_chunks = (len(seqs) + CH - 1) // CH
+        nchunks_t = torch.tensor([local_chunks], device=torch.cuda.current_device())
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.all_reduce(nchunks_t, op=torch.distributed.ReduceOp.MAX)
+        nchunks = int(nchunks_t.item())
+        with self.ulysses_sharding_manager:
+            for c in range(nchunks):
+                s0 = c * CH
+                chunk = seqs[s0:s0 + CH]
+                if chunk:
+                    ams = amasks[s0:s0 + CH]; real = len(chunk)
+                else:
+                    chunk = [[pad_id]]; ams = [[0]]; real = 0    # dummy to stay in sync
+                L = max(len(x) for x in chunk)
+                ids = torch.tensor([[pad_id] * (L - len(x)) + x for x in chunk],
+                                   dtype=torch.long, device=torch.cuda.current_device())
+                att = torch.tensor([[0] * (L - len(x)) + [1] * len(x) for x in chunk],
+                                   dtype=torch.long, device=torch.cuda.current_device())
+                amt = torch.tensor([[0] * (L - len(a)) + a for a in ams],
+                                   dtype=torch.long, device=torch.cuda.current_device())
+                mlp = self.actor.compute_perstep_action_logp(ids, att, amt, temperature)  # (chunk,)
+                for j in range(real):
+                    i, span = locs[s0 + j]
+                    h_log_probs[i, span[0]:span[1]] = float(mlp[j].item())
+
+        output = DataProto.from_dict(tensors={'h_log_probs': h_log_probs})
+        if self.world_size > 1:
+            self.actor.actor_module._handle.reshard(True)
+        if self._is_offload_param:
+            offload_fsdp_param_and_grad(module=self.actor_module_fsdp, offload_grad=self._is_offload_grad)
+        torch.cuda.empty_cache()
+        return output
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    def compute_pe_labels(self, data: DataProto):
+        """Classify PROGRESS + EXPLORATION steps per trajectory (text classifiers) and
+        return per-action-token masks (B,T): 'pe_progress_mask', 'pe_explore_mask'
+        (1 on the action tokens of classified progress / exploration turns). Two
+        generations per trajectory via the rollout engine. Default-off path."""
+        from verl.agent_trainer.ppo.progress_credit_probe import (
+            extract_goal, trajectory_steps, build_progress_messages, build_explore_messages,
+            parse_progress, parse_explore)
+        from verl.agent_trainer.ppo.wmc_erc import _turn_spans
+        assert self._is_rollout
+        data = data.to('cuda')
+        env = str(self.config.actor.get('pe_clf_env', 'alfworld'))
+        max_new = int(self.config.actor.get('pe_clf_max_new_tokens', 160))
+        messages = data.non_tensor_batch['rollout_messages']
+        response_mask = data.batch['response_mask']
+        B, T = response_mask.shape
+        pm = torch.zeros(B, T, dtype=torch.float32)
+        em = torch.zeros(B, T, dtype=torch.float32)
+        pad_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id
+        # build classification prompts (non-collective; per-traj guarded so one bad
+        # trajectory never aborts this rank and desyncs it from the others).
+        prompts, meta, spans_per = [], [], []        # meta: (traj_i, kind, n_steps)
+        for i in range(B):
+            spans = _turn_spans(response_mask[i].to(torch.bool))
+            spans_per.append(spans)
+            try:
+                conv = list(messages[i]); goal = extract_goal(conv); steps = trajectory_steps(conv)
+                for kind, build in (("P", build_progress_messages), ("E", build_explore_messages)):
+                    ids = self.tokenizer.apply_chat_template(build(env, goal, steps),
+                                                             add_generation_prompt=True, tokenize=True)
+                    prompts.append(ids); meta.append((i, kind, len(steps)))
+            except Exception as e:
+                print(f'[compute_pe_labels] prompt build failed for traj {i}: {e}')
+        # COLLECTIVE: EVERY rank MUST enter the rollout sharding manager + generate
+        # exactly once, or the weight-sync all-gather desyncs and deadlocks (NCCL
+        # timeout). Pad with a dummy prompt if this rank built none.
+        try:
+            with self.rollout_sharding_manager:
+                texts = self.rollout.generate_text_batch(prompts or [[pad_id]], max_new_tokens=max_new)
+        except Exception as e:
+            print(f'[compute_pe_labels] generation failed: {e}')
+            texts = []
+        # scatter masks (non-collective; guarded)
+        if prompts:
+            for (i, kind, n_steps), txt in zip(meta, texts):
+                try:
+                    spans = spans_per[i]
+                    idxs = parse_progress(txt, n_steps) if kind == "P" else parse_explore(txt, n_steps)
+                    tgt = pm if kind == "P" else em
+                    for t in idxs:
+                        if t < len(spans):
+                            tgt[i, spans[t][0]:spans[t][1]] = 1.0
+                except Exception:
+                    pass
+        output = DataProto.from_dict(tensors={'pe_progress_mask': pm, 'pe_explore_mask': em})
+        output = output.to('cpu')
+        torch.cuda.empty_cache()
         return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
@@ -581,41 +769,6 @@ class ActorRolloutRefWorker(Worker):
         # clear kv cache
         torch.cuda.empty_cache()
         log_gpu_memory_usage('After compute_log_prob', logger=logger)
-        return output
-
-    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
-    def compute_state_values(self, data: DataProto):
-        """Compute per-turn state values V(s_t) using the actor's value head.
-
-        Only valid when the actor was constructed with use_value_baseline=True
-        (otherwise self.actor.value_head is None and this will assert).
-        """
-        assert self._is_actor
-        if self._is_offload_param:
-            load_fsdp_param_and_grad(module=self.actor_module_fsdp,
-                                     device_id=torch.cuda.current_device(),
-                                     load_grad=self._is_offload_grad)
-        data = data.to('cuda')
-        data.meta_info['micro_batch_size'] = self.config.rollout.log_prob_micro_batch_size_per_gpu
-        data.meta_info['max_token_len'] = self.config.rollout.log_prob_max_token_len_per_gpu
-        data.meta_info['use_dynamic_bsz'] = self.config.rollout.log_prob_use_dynamic_bsz
-        data.meta_info['temperature'] = self.config.rollout.temperature
-        with self.ulysses_sharding_manager:
-            data = self.ulysses_sharding_manager.preprocess_data(data)
-            state_values, state_values_mask = self.actor.compute_state_values(data=data)
-            output = DataProto.from_dict(
-                tensors={'state_values': state_values, 'state_values_mask': state_values_mask})
-            output = self.ulysses_sharding_manager.postprocess_data(output)
-
-        output = output.to('cpu')
-
-        if self.world_size > 1:
-            self.actor.actor_module._handle.reshard(True)
-
-        if self._is_offload_param:
-            offload_fsdp_param_and_grad(module=self.actor_module_fsdp, offload_grad=self._is_offload_grad)
-
-        torch.cuda.empty_cache()
         return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)

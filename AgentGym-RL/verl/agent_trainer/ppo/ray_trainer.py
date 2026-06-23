@@ -36,7 +36,6 @@ from verl.agent_trainer.ppo import core_algos
 from verl.agent_trainer.ppo.wmc_erc import (
     apply_wmc_erc,
     apply_wmc_erc_to_reward,
-    apply_value_baseline_redistribution,
     apply_hca_advantage,
     apply_ref_nll_add_advantage,
     compute_turn_boundaries,
@@ -44,6 +43,10 @@ from verl.agent_trainer.ppo.wmc_erc import (
 from verl.agent_trainer.ppo.world_model_loss import (
     DEFAULT_WORLD_MODEL_PROMPT,
     build_world_model_sft_batch,
+)
+from verl.agent_trainer.ppo.plan_forecast import (
+    DEFAULT_PLAN_PROMPT,
+    build_plan_forecast_batch,
 )
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
@@ -554,27 +557,9 @@ class RayPPOTrainer(object):
         else:
             raise NotImplementedError
 
-        # Optional GRPO state-value baseline (turn-level redistribution).
-        # When disabled (default), no state_values are computed and the
-        # advantage path is bit-for-bit identical to the original GRPO code.
-        self.use_value_baseline = bool(
-            self.config.actor_rollout_ref.actor.get('use_value_baseline', False))
-        self.value_baseline_beta = float(
-            self.config.actor_rollout_ref.actor.get('value_baseline_beta', 1.0))
-        # Linear warmup on β so the early-step noisy V doesn't pollute the
-        # GRPO advantage. β_eff = β · min(1, global_step / warmup_steps).
-        # Default 20 — covers the empirically observed noisy-V window (step
-        # 8-24 in the May-31 alfworld run).
-        self.value_baseline_beta_warmup_steps = int(
-            self.config.actor_rollout_ref.actor.get('value_baseline_beta_warmup_steps', 20))
-
-        # Hindsight Credit Assignment (HCA) — see feature.md. Hard mutex
-        # with value baseline (a duplicate assert in DataParallelPPOActor
-        # catches the worker-side too).
+        # Hindsight Credit Assignment (HCA) — see feature.md.
         self.use_hindsight_hca = bool(
             self.config.actor_rollout_ref.actor.get('use_hindsight_hca', False))
-        assert not (self.use_value_baseline and self.use_hindsight_hca), \
-            'USE_VALUE_BASELINE and USE_HINDSIGHT_HCA are mutually exclusive.'
         # HCAPO (training-free generative verification) hyperparameters.
         _a = self.config.actor_rollout_ref.actor
         self.hca_ratio_clip_min = float(_a.get('hca_ratio_clip_min', 0.8))
@@ -584,6 +569,10 @@ class RayPPOTrainer(object):
         self.hca_gamma = float(_a.get('hca_gamma', 0.95))
         self.hca_smooth_alpha = float(_a.get('hca_smooth_alpha', 0.5))
         self.hca_z_threshold = float(_a.get('hca_z_threshold', 0.5))
+        # HCAPO-aligned per-step LOCAL injection (paper §4.2). Default OFF keeps the
+        # old single-front-injection path; ON reconstructs truncated per-step prompts
+        # so π_hind actually carries the hindsight signal (not cancelled by ÷π̄).
+        self.hca_perstep = bool(_a.get('hca_perstep', False))
 
         # Safe-commit TEXT gate (default OFF). When on, classify each scored turn's
         # outcome predictability (text classifier) and AND it with low action-entropy
@@ -594,6 +583,15 @@ class RayPPOTrainer(object):
         self.safe_commit_clf_env = str(_w.get('safe_commit_clf_env', 'alfworld')) if _w else 'alfworld'
         self.safe_commit_clf_max_new = int(_w.get('safe_commit_clf_max_new_tokens', 24)) if _w else 24
         self.safe_commit_clf_wins_only = bool(_w.get('safe_commit_clf_wins_only', True)) if _w else True
+
+        # Progress/Exploration credit (default OFF): classify P/E steps per trajectory
+        # and add an all-positive advantage bonus (omega_p on progress, omega_e on
+        # exploration; P>E; P/E overlap -> P). Applied on winning trajectories.
+        _pa = self.config.actor_rollout_ref.actor
+        self.pe_credit_enable = bool(_pa.get('pe_credit_enable', False))
+        self.pe_omega_progress = float(_pa.get('pe_omega_progress', 0.5))
+        self.pe_omega_explore = float(_pa.get('pe_omega_explore', 0.2))
+        self.pe_credit_wins_only = bool(_pa.get('pe_credit_wins_only', True))
 
         self._validate_config()
         self._create_dataloader()
@@ -943,6 +941,44 @@ class RayPPOTrainer(object):
             return None
         return DataProto.from_single_dict(assembled)
 
+    def _build_plan_forecast_dataproto(self, batch: DataProto):
+        """Build a plan-forecast SFT DataProto (predict realized next-K actions).
+
+        Returns (dataproto, meta) or (None, meta). ``None`` when disabled, no
+        ``rollout_messages``, or no qualifying step. Wins-gate uses per-traj
+        reward from ``traj_return`` (fallback: token_level_scores.sum)."""
+        actor_cfg = self.config.actor_rollout_ref.actor
+        if not actor_cfg.get('plan_forecast_enable', False):
+            return None, {}
+        coef = float(actor_cfg.get('plan_forecast_coef', 0.0))
+        if coef <= 0:
+            return None, {'plan_forecast/coef': 0.0}
+
+        messages_list = batch.non_tensor_batch.get('rollout_messages', None)
+        if messages_list is None:
+            return None, {'plan_forecast/skipped_no_msgs': 1.0}
+
+        rewards = None
+        if 'traj_return' in batch.batch.keys():
+            rewards = batch.batch['traj_return'].tolist()
+        elif 'token_level_scores' in batch.batch.keys():
+            rewards = batch.batch['token_level_scores'].sum(dim=-1).tolist()
+
+        assembled, meta = build_plan_forecast_batch(
+            messages_list=list(messages_list),
+            tokenizer=self.tokenizer,
+            rewards=rewards,
+            k=int(actor_cfg.get('plan_forecast_k', 3)),
+            gate=str(actor_cfg.get('plan_forecast_gate', 'wins')),
+            success_threshold=float(actor_cfg.get('plan_forecast_success_threshold', 0.5)),
+            plan_prompt=actor_cfg.get('plan_forecast_prompt', None) or DEFAULT_PLAN_PROMPT,
+            max_length=int(actor_cfg.get('plan_forecast_max_length', 4096)),
+            max_samples_per_trajectory=actor_cfg.get('plan_forecast_max_samples_per_traj', None),
+        )
+        if assembled is None:
+            return None, meta
+        return DataProto.from_single_dict(assembled), meta
+
     def _balance_batch(self, batch: DataProto, metrics, logging_prefix='global_seqlen'):
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""
         attention_mask = batch.batch['attention_mask']
@@ -1148,12 +1184,6 @@ class RayPPOTrainer(object):
                             values = self.critic_wg.compute_values(batch)
                             batch = batch.union(values)
 
-                    # compute per-turn state values via the actor's value head
-                    if self.use_value_baseline:
-                        with _timer('state_values', timing_raw):
-                            state_values_out = self.actor_rollout_wg.compute_state_values(batch)
-                            batch = batch.union(state_values_out)
-
                     with _timer('adv', timing_raw):
                         # we combine with rule-based rm
                         reward_tensor = batch.batch['scores']
@@ -1162,11 +1192,6 @@ class RayPPOTrainer(object):
                             # Per-trajectory R for outcome label z and HCA
                             # centered baseline (R − b(s_t)). Set BEFORE
                             # GRPO advantage so it's available downstream.
-                            batch.batch['traj_return'] = reward_tensor.sum(dim=-1)
-                        if self.use_value_baseline:
-                            # Per-trajectory outcome reward R (sum over the
-                            # sparse-end placement done by the rollout). Used
-                            # as the V-head MSE target inside update_policy.
                             batch.batch['traj_return'] = reward_tensor.sum(dim=-1)
 
                         # compute rewards. apply_kl_penalty if available
@@ -1210,21 +1235,18 @@ class RayPPOTrainer(object):
                                                   lam=self.config.algorithm.lam,
                                                   num_repeat=self.config.actor_rollout_ref.rollout.n)
 
-                        if self.use_value_baseline and 'state_values' in batch.batch.keys():
-                            warm = max(1, self.value_baseline_beta_warmup_steps)
-                            beta_eff = self.value_baseline_beta * min(
-                                1.0, float(self.global_steps) / warm)
-                            vb_metrics = apply_value_baseline_redistribution(
-                                data=batch, beta=beta_eff)
-                            vb_metrics['value_baseline/beta_eff'] = beta_eff
-                            metrics.update(vb_metrics)
-
                         # HCAPO path (training-free): re-prompt the frozen
                         # policy with the realized outcome, form per-action
                         # hindsight Q-values, add the cross-state-normalized
                         # micro advantage to the GRPO macro advantage in place.
                         if self.use_hindsight_hca:
                             with _timer('hca_h_log_probs', timing_raw):
+                                # Front injection: insert s_final right AFTER the original
+                                # prompt (between prompt and response) and read the action
+                                # log-probs in a SINGLE forward over the trajectory. The
+                                # per-step reconstruction path was retired — it caused FSDP
+                                # all-gather desync (variable forwards/rank) and was OOD for
+                                # our full-history agent. (hca_perstep is now a no-op.)
                                 h_lp_out = self.actor_rollout_wg.compute_hindsight_log_probs(batch)
                                 batch = batch.union(h_lp_out)
                             hca_metrics = apply_hca_advantage(
@@ -1265,6 +1287,32 @@ class RayPPOTrainer(object):
                         if 'entropys' in batch.batch.keys():
                             batch.batch.pop('entropys')
 
+                        # Progress/Exploration credit (default OFF). Classify P/E
+                        # steps per trajectory and add an all-positive advantage
+                        # bonus (omega_p on progress, omega_e on exploration; P>E;
+                        # overlap -> P; winning trajectories only). Guarded.
+                        if self.pe_credit_enable:
+                            try:
+                                from verl.agent_trainer.ppo.pe_credit import apply_pe_credit
+                                with _timer('pe_credit', timing_raw):
+                                    pe_out = self.actor_rollout_wg.compute_pe_labels(batch)
+                                    batch = batch.union(pe_out)
+                                    new_adv, pe_metrics = apply_pe_credit(
+                                        advantages=batch.batch['advantages'],
+                                        response_mask=batch.batch['response_mask'],
+                                        progress_mask=batch.batch['pe_progress_mask'],
+                                        explore_mask=batch.batch['pe_explore_mask'],
+                                        omega_p=self.pe_omega_progress,
+                                        omega_e=self.pe_omega_explore,
+                                        wins_only=self.pe_credit_wins_only)
+                                    batch.batch['advantages'] = new_adv
+                                    batch.batch.pop('pe_progress_mask', None)
+                                    batch.batch.pop('pe_explore_mask', None)
+                                metrics.update(pe_metrics)
+                            except Exception as e:
+                                print(f'[pe_credit] skipped due to: {e}')
+                                metrics['pe_credit/error'] = 1.0
+
                     # update critic
                     if self.use_critic:
                         with _timer('update_critic', timing_raw):
@@ -1279,6 +1327,25 @@ class RayPPOTrainer(object):
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
                         metrics.update(actor_output_metrics)
+
+                        # Optional plan-forecast SFT update: predict the realized
+                        # next-K actions (the "plan"), supervised by what actually
+                        # happened. Separate forward, does NOT touch PG. Default OFF.
+                        try:
+                            pf_data, pf_meta = self._build_plan_forecast_dataproto(batch)
+                            metrics.update(pf_meta)
+                            if pf_data is not None and len(pf_data) > 0:
+                                pf_data_padded, _pf_pad = pad_dataproto_to_divisor(
+                                    pf_data, self.actor_rollout_wg.world_size)
+                                with _timer('update_plan_forecast', timing_raw):
+                                    pf_output = self.actor_rollout_wg.update_actor_plan_forecast(pf_data_padded)
+                                metrics.update(reduce_metrics(pf_output.meta_info['metrics']))
+                                metrics['plan_forecast/num_samples'] = len(pf_data)
+                            else:
+                                metrics['plan_forecast/num_samples'] = 0
+                        except Exception as e:
+                            print(f"[plan_forecast] skipped due to error: {e}", flush=True)
+                            metrics['plan_forecast/error'] = 1.0
 
                         # Optional world-model SFT update on env-prediction data
                         # re-assembled with chat template from the rollout.
