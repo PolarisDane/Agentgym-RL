@@ -199,8 +199,8 @@ class vLLMRollout(BaseRollout):
     def _shape_task_reward(self, task_score: float, task_done: bool, task_name: str = "") -> float:
         if str(task_name).lower() == "sciworld":
             return 1.0 if bool(task_done) and float(task_score) >= 100.0 else 0.0
-        # elif str(task_name).lower() == "webshop":
-        #     return 1.0 if bool(task_done) and float(task_score) >= 1.0 else 0.0
+        elif str(task_name).lower() == "webshop":
+            return 1.0 if bool(task_done) and float(task_score) >= 1.0 else 0.0
         else:
             return task_score
 
@@ -240,6 +240,21 @@ class vLLMRollout(BaseRollout):
         max_rounds = prompts.meta_info.get('max_rounds', 10)
         cur_device = prompts.batch["input_ids"].device
 
+        # Per-turn reminder appended to every observation. Two mutually-exclusive
+        # kinds (selected upstream in ray_trainer): 'plan' = re-state the inline
+        # Plan format each turn; 'think' = only nudge a Thought-before-Action.
+        plan_reminder = ""
+        _rk = prompts.meta_info.get('per_turn_reminder', None)
+        if _rk == 'plan':
+            from verl.agent_trainer.ppo.plan_forecast import inline_plan_reminder
+            plan_reminder = inline_plan_reminder(int(prompts.meta_info.get('plan_inline_k', 3)))
+        elif _rk == 'todo':
+            from verl.agent_trainer.ppo.plan_forecast import todo_plan_reminder
+            plan_reminder = todo_plan_reminder(int(prompts.meta_info.get('plan_inline_k', 3)))
+        elif _rk == 'think':
+            from verl.agent_trainer.ppo.plan_forecast import think_reminder
+            plan_reminder = think_reminder()
+
         do_sample = prompts.meta_info.get('do_sample', True)
         if not do_sample:
             kwargs = {
@@ -262,7 +277,7 @@ class vLLMRollout(BaseRollout):
             try:
                 env_clients[idx].reset(rollout_handler.item_id)
                 task = env_clients[idx].observe()
-                rollout_handler.add_user_message(self.tokenizer, task)
+                rollout_handler.add_user_message(self.tokenizer, task + plan_reminder)
             except TimeoutError:
                 print(f"Reset Timeout: Webarena Env Timeout. item id = {rollout_handler.item_id}")
                 rollout_handler.done = True
@@ -282,7 +297,7 @@ class vLLMRollout(BaseRollout):
                     step_output.reward,
                     step_output.done,
                 )
-                rollout_handler_ls[idx].add_user_message(self.tokenizer, state)
+                rollout_handler_ls[idx].add_user_message(self.tokenizer, state + plan_reminder)
                 return step_output.done
             except Exception as e:
                 rollout_handler_ls[idx].score = 0

@@ -45,7 +45,6 @@ from verl.agent_trainer.ppo.world_model_loss import (
     build_world_model_sft_batch,
 )
 from verl.agent_trainer.ppo.plan_forecast import (
-    DEFAULT_PLAN_PROMPT,
     build_plan_forecast_batch,
 )
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
@@ -593,6 +592,23 @@ class RayPPOTrainer(object):
         self.pe_omega_explore = float(_pa.get('pe_omega_explore', 0.2))
         self.pe_credit_wins_only = bool(_pa.get('pe_credit_wins_only', True))
 
+        # Plan FORMAT reward (default OFF): per-turn shaping bonus on the advantage
+        # for emitting a well-formed Thought->Plan->Action turn, to counter the
+        # decay of inline-plan behaviour under RL.
+        self.plan_format_reward_enable = bool(_pa.get('plan_format_reward_enable', False))
+        self.plan_format_reward_coef = float(_pa.get('plan_format_reward_coef', 0.05))
+        self.plan_format_reward_baseline = float(_pa.get('plan_format_reward_baseline', 0.5))
+        self.plan_format_reward_clip = float(_pa.get('plan_format_reward_clip', 0.0))
+        # penalty_only (default True): only penalize turns that DROP the plan,
+        # never reward keeping it -> dormant while compliant, no length/positive bias.
+        self.plan_format_reward_penalty_only = bool(_pa.get('plan_format_reward_penalty_only', True))
+        # warmup: keep the format reward OFF until global_step >= warmup_steps, so
+        # the policy can learn the task (and compress) first before plan pressure.
+        self.plan_format_reward_warmup_steps = int(_pa.get('plan_format_reward_warmup_steps', 10))
+        self.plan_format_reward_k = int(_pa.get('plan_format_reward_k',
+                                                int(self.config.data.get('plan_inline_k', 3))
+                                                if hasattr(self.config, 'data') else 3))
+
         self._validate_config()
         self._create_dataloader()
 
@@ -741,6 +757,11 @@ class RayPPOTrainer(object):
             )
         else:
             raise NotImplementedError
+
+        # Plan-forecast coefficient scheduler (anneal plan_forecast_coef).
+        # Reuses the generic coeff schedulers above. Knobs live on the actor
+        # config next to the other plan_forecast_* settings.
+        self.plan_forecast_coeff_scheduler = self._build_plan_forecast_scheduler()
 
         OmegaConf.set_struct(self.config, True)
         with open_dict(self.config):
@@ -941,16 +962,37 @@ class RayPPOTrainer(object):
             return None
         return DataProto.from_single_dict(assembled)
 
-    def _build_plan_forecast_dataproto(self, batch: DataProto):
+    def _build_plan_forecast_scheduler(self):
+        """Coeff scheduler for plan_forecast_coef. anneal in {fixed,linear,power,
+        cutoff}; reuses the generic *WorldModelCoeffScheduler classes. start =
+        plan_forecast_coef."""
+        actor_cfg = self.config.actor_rollout_ref.actor
+        anneal = str(actor_cfg.get('plan_forecast_coef_anneal', 'fixed')).lower()
+        start = float(actor_cfg.get('plan_forecast_coef', 0.0))
+        end = float(actor_cfg.get('plan_forecast_coef_end', 0.0))
+        horizon = int(actor_cfg.get('plan_forecast_coef_horizon', 0))
+        if anneal in ('fixed', 'none', ''):
+            return FixedWorldModelCoeffScheduler(coeff=start)
+        if anneal == 'linear':
+            return LinearWorldModelCoeffScheduler(start_coeff=start, end_coeff=end, horizon=horizon)
+        if anneal == 'power':
+            return PowerWorldModelCoeffScheduler(start_coeff=start, end_coeff=end, horizon=horizon,
+                                                 power=float(actor_cfg.get('plan_forecast_coef_power', 2.0)))
+        if anneal == 'cutoff':
+            return CutoffWorldModelCoeffScheduler(start_coeff=start, end_coeff=end,
+                                                  cutoff_step=int(actor_cfg.get('plan_forecast_coef_cutoff_step', 0)))
+        raise NotImplementedError(f"unknown plan_forecast_coef_anneal: {anneal}")
+
+    def _build_plan_forecast_dataproto(self, batch: DataProto, coef: float):
         """Build a plan-forecast SFT DataProto (predict realized next-K actions).
 
-        Returns (dataproto, meta) or (None, meta). ``None`` when disabled, no
-        ``rollout_messages``, or no qualifying step. Wins-gate uses per-traj
-        reward from ``traj_return`` (fallback: token_level_scores.sum)."""
+        ``coef`` is the CURRENT (annealed) coefficient. Returns (dataproto, meta)
+        or (None, meta). ``None`` when disabled, coef<=0, no ``rollout_messages``,
+        or no qualifying step. Wins-gate uses per-traj reward from ``traj_return``
+        (fallback: token_level_scores.sum)."""
         actor_cfg = self.config.actor_rollout_ref.actor
         if not actor_cfg.get('plan_forecast_enable', False):
             return None, {}
-        coef = float(actor_cfg.get('plan_forecast_coef', 0.0))
         if coef <= 0:
             return None, {'plan_forecast/coef': 0.0}
 
@@ -964,6 +1006,20 @@ class RayPPOTrainer(object):
         elif 'token_level_scores' in batch.batch.keys():
             rewards = batch.batch['token_level_scores'].sum(dim=-1).tolist()
 
+        # target: 'action' (block2-success, predict realized next-K actions) or
+        # 'subgoal' (predict next-K hindsight-confirmed achieved sub-goals).
+        target = str(actor_cfg.get('plan_forecast_target', 'action')).lower()
+        # seq: 'separate' (block2 — synthetic prompt + bare list, standalone) or
+        # 'inline_consistent' (SFT sample matches a real rollout turn: obs ->
+        # Plan+Action). inline_consistent only makes sense with inline plan ON; if
+        # inline is off it falls back to separate to avoid teaching an unused format.
+        seq = str(actor_cfg.get('plan_forecast_seq', 'separate')).lower()
+        inline_on = bool(hasattr(self.config, 'data')
+                         and self.config.data.get('plan_inline_enable', False))
+        if seq == 'inline_consistent' and not inline_on:
+            print("[plan_forecast] seq=inline_consistent -> separate (inline plan OFF)", flush=True)
+            seq = 'separate'
+
         assembled, meta = build_plan_forecast_batch(
             messages_list=list(messages_list),
             tokenizer=self.tokenizer,
@@ -971,13 +1027,55 @@ class RayPPOTrainer(object):
             k=int(actor_cfg.get('plan_forecast_k', 3)),
             gate=str(actor_cfg.get('plan_forecast_gate', 'wins')),
             success_threshold=float(actor_cfg.get('plan_forecast_success_threshold', 0.5)),
-            plan_prompt=actor_cfg.get('plan_forecast_prompt', None) or DEFAULT_PLAN_PROMPT,
+            target=target,
+            seq=seq,
             max_length=int(actor_cfg.get('plan_forecast_max_length', 4096)),
             max_samples_per_trajectory=actor_cfg.get('plan_forecast_max_samples_per_traj', None),
         )
         if assembled is None:
             return None, meta
         return DataProto.from_single_dict(assembled), meta
+
+    def _apply_plan_format_reward(self, batch: DataProto):
+        """Driver-side plan FORMAT reward: score each generated turn's text for
+        Thought->Plan->Action compliance and add coef*(score-baseline) to that
+        turn's advantage tokens. Pure text parsing (no worker). Fully guarded.
+
+        Returns a metrics dict; mutates batch.batch['advantages'] in place.
+        """
+        from verl.agent_trainer.ppo.plan_format import (
+            score_turn_format, apply_plan_format_advantage)
+        from verl.agent_trainer.ppo.plan_forecast import _action_turn_indices, _to_chat_list
+        if 'rollout_messages' not in batch.non_tensor_batch:
+            return {'plan_format/skipped_no_msgs': 1.0}
+        msgs = batch.non_tensor_batch['rollout_messages']
+        advantages = batch.batch['advantages']
+        response_mask = batch.batch['response_mask']
+        B, T = advantages.shape
+        k = self.plan_format_reward_k
+        tb = compute_turn_boundaries(response_mask)             # per-traj action spans
+        format_tok = torch.zeros(B, T, dtype=advantages.dtype, device=advantages.device)
+        n_turns = 0
+        for i in range(B):
+            spans = tb[i]
+            if not spans:
+                continue
+            convo = _to_chat_list(msgs[i])
+            turns = [convo[ai].get('content', '') or '' for ai in _action_turn_indices(convo)]
+            for j, (s, e) in enumerate(spans):
+                if j >= len(turns):
+                    break
+                sc = score_turn_format(turns[j], k=k)
+                format_tok[i, s:e] = sc
+                n_turns += 1
+        new_adv, metrics = apply_plan_format_advantage(
+            advantages=advantages, response_mask=response_mask, format_tok=format_tok,
+            coef=self.plan_format_reward_coef, baseline=self.plan_format_reward_baseline,
+            clip=self.plan_format_reward_clip,
+            penalty_only=self.plan_format_reward_penalty_only)
+        batch.batch['advantages'] = new_adv
+        metrics['plan_format/num_turns'] = float(n_turns)
+        return metrics
 
     def _balance_batch(self, batch: DataProto, metrics, logging_prefix='global_seqlen'):
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""
@@ -1106,6 +1204,12 @@ class RayPPOTrainer(object):
             for batch_dict in self.train_dataloader:
                 metrics = {}
                 timing_raw = {}
+                # keep the dataset's step in sync for step-gated inline warmup
+                # (num_workers=0 -> same object; <=1-step lag is fine for a threshold)
+                try:
+                    self.train_dataset.current_step = self.global_steps
+                except Exception:
+                    pass
 
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
 
@@ -1118,6 +1222,33 @@ class RayPPOTrainer(object):
                 gen_batch = batch.pop(batch_keys=['input_ids', 'attention_mask', 'position_ids'], non_tensor_batch_keys=['item_id', 'raw_prompt'])
                 gen_batch.meta_info['global_steps'] = self.global_steps
                 gen_batch.meta_info['max_rounds'] = self.rounds_scheduler.get_rounds()
+                # Block-1 per-turn plan reminder: when inline plan is on, re-state
+                # the "Plan first" request after EVERY observation (a one-time
+                # instruction decays over turns). Routed via gen meta_info. Gated by
+                # plan_inline_warmup_steps: during warmup the original prompt is used
+                # (no reminder), the plan prompt is introduced only at/after warmup.
+                _data_cfg = getattr(self.config, 'data', None)
+                _inline_warmup = int(_data_cfg.get('plan_inline_warmup_steps', 0)) if _data_cfg is not None else 0
+                # per-turn reminder ARCHIVED (default OFF) -> inline uses the opening
+                # standing instruction only. Set data.plan_inline_per_turn=True to revive.
+                _inline_active = (_data_cfg is not None
+                                  and bool(_data_cfg.get('plan_inline_enable', False))
+                                  and bool(_data_cfg.get('plan_inline_per_turn', False))
+                                  and self.global_steps >= _inline_warmup)
+                _think_on = _data_cfg is not None and bool(_data_cfg.get('think_reminder_enable', False))
+                # Mutually exclusive per-turn reminders: inline-plan takes priority.
+                # plan_inline_style: 'actions' (next-K actions) | 'todo' (checkable
+                # sub-goal TODO list with (done) marks; pairs with target=subgoal).
+                if _inline_active:
+                    _style = str(_data_cfg.get('plan_inline_style', 'actions')).lower()
+                    gen_batch.meta_info['per_turn_reminder'] = 'todo' if _style == 'todo' else 'plan'
+                    gen_batch.meta_info['plan_inline_k'] = int(_data_cfg.get('plan_inline_k', 3))
+                    metrics['plan_inline/active'] = 1.0
+                elif _think_on:
+                    gen_batch.meta_info['per_turn_reminder'] = 'think'
+                    metrics['think_reminder/active'] = 1.0
+                elif _data_cfg is not None and bool(_data_cfg.get('plan_inline_enable', False)):
+                    metrics['plan_inline/active'] = 0.0   # inline in warmup -> original prompt
                 metrics.update({
                     'max_rounds': self.rounds_scheduler.get_rounds(),
                 })
@@ -1313,6 +1444,31 @@ class RayPPOTrainer(object):
                                 print(f'[pe_credit] skipped due to: {e}')
                                 metrics['pe_credit/error'] = 1.0
 
+                        # Plan FORMAT reward (default OFF): per-turn shaping bonus
+                        # on the advantage for well-formed Thought->Plan->Action
+                        # turns, to counter inline-plan decay. Driver-side, guarded.
+                        if self.plan_format_reward_enable:
+                            # format reward needs a plan to score -> only fire when
+                            # inline is ACTIVE (enabled and past inline warmup), and
+                            # past its own warmup. Otherwise it would penalize every
+                            # (plan-less) turn during the original-prompt window.
+                            _inl_warm = int(self.config.data.get('plan_inline_warmup_steps', 0)) \
+                                if hasattr(self.config, 'data') else 0
+                            _inline_active = (hasattr(self.config, 'data')
+                                              and bool(self.config.data.get('plan_inline_enable', False))
+                                              and self.global_steps >= _inl_warm)
+                            if self.global_steps < self.plan_format_reward_warmup_steps or not _inline_active:
+                                # still in warmup -> format reward dormant
+                                metrics['plan_format/warmup'] = 1.0
+                            else:
+                                try:
+                                    with _timer('plan_format_reward', timing_raw):
+                                        metrics.update(self._apply_plan_format_reward(batch))
+                                    metrics['plan_format/warmup'] = 0.0
+                                except Exception as e:
+                                    print(f'[plan_format] skipped due to: {e}')
+                                    metrics['plan_format/error'] = 1.0
+
                     # update critic
                     if self.use_critic:
                         with _timer('update_critic', timing_raw):
@@ -1332,11 +1488,16 @@ class RayPPOTrainer(object):
                         # next-K actions (the "plan"), supervised by what actually
                         # happened. Separate forward, does NOT touch PG. Default OFF.
                         try:
-                            pf_data, pf_meta = self._build_plan_forecast_dataproto(batch)
+                            self.plan_forecast_coeff_scheduler.set_global_steps(self.global_steps)
+                            pf_coef = float(self.plan_forecast_coeff_scheduler.get_coeff())
+                            metrics['plan_forecast/coef_sched'] = pf_coef
+                            pf_data, pf_meta = self._build_plan_forecast_dataproto(batch, pf_coef)
                             metrics.update(pf_meta)
                             if pf_data is not None and len(pf_data) > 0:
+                                pf_data.meta_info['plan_forecast_coef'] = pf_coef
                                 pf_data_padded, _pf_pad = pad_dataproto_to_divisor(
                                     pf_data, self.actor_rollout_wg.world_size)
+                                pf_data_padded.meta_info['plan_forecast_coef'] = pf_coef
                                 with _timer('update_plan_forecast', timing_raw):
                                     pf_output = self.actor_rollout_wg.update_actor_plan_forecast(pf_data_padded)
                                 metrics.update(reduce_metrics(pf_output.meta_info['metrics']))

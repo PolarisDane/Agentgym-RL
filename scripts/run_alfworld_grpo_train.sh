@@ -46,6 +46,9 @@ PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-8}"
 PPO_MICRO_BATCH_SIZE_PER_GPU="${PPO_MICRO_BATCH_SIZE_PER_GPU:-1}"
 PPO_EPOCHS="${PPO_EPOCHS:-1}"
 TOTAL_EPOCHS="${TOTAL_EPOCHS:-2}"
+# Hard cap on optimizer steps (null = use len(dataloader)*total_epochs). Set a
+# small value (e.g. 12) for short validation runs.
+TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-null}"
 MAX_ROUNDS="${MAX_ROUNDS:-20}"
 MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-1024}"
 MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-8192}"
@@ -190,14 +193,50 @@ PE_CLF_ENV="${PE_CLF_ENV:-alfworld}"
 PLAN_FORECAST_ENABLE="${PLAN_FORECAST_ENABLE:-True}"
 PLAN_FORECAST_COEF="${PLAN_FORECAST_COEF:-0.01}"
 PLAN_FORECAST_K="${PLAN_FORECAST_K:-3}"
-PLAN_FORECAST_GATE="${PLAN_FORECAST_GATE:-wins}"
+PLAN_FORECAST_GATE="${PLAN_FORECAST_GATE:-all}"
 PLAN_FORECAST_SUCCESS_THRESHOLD="${PLAN_FORECAST_SUCCESS_THRESHOLD:-0.5}"
 PLAN_FORECAST_MAX_LENGTH="${PLAN_FORECAST_MAX_LENGTH:-4096}"
+# plan_forecast target: action (predict realized next-K actions; block2-success,
+# grounded) | subgoal (predict next-K hindsight-confirmed achieved sub-goals).
+PLAN_FORECAST_TARGET="${PLAN_FORECAST_TARGET:-action}"
+# plan_forecast seq: separate (block2 — synthetic prompt + bare list, standalone;
+# use with inline OFF) | inline_consistent (SFT sample matches a real rollout turn
+# obs->Plan+Action; use with inline ON). inline_consistent auto-falls-back to
+# separate when inline is off.
+PLAN_FORECAST_SEQ="${PLAN_FORECAST_SEQ:-separate}"
+# plan_forecast_coef anneal: fixed | linear | power | cutoff (start = PLAN_FORECAST_COEF).
+PLAN_FORECAST_COEF_ANNEAL="${PLAN_FORECAST_COEF_ANNEAL:-fixed}"
+PLAN_FORECAST_COEF_END="${PLAN_FORECAST_COEF_END:-0.0}"
+PLAN_FORECAST_COEF_HORIZON="${PLAN_FORECAST_COEF_HORIZON:-25}"
+PLAN_FORECAST_COEF_POWER="${PLAN_FORECAST_COEF_POWER:-2.0}"
+PLAN_FORECAST_COEF_CUTOFF_STEP="${PLAN_FORECAST_COEF_CUTOFF_STEP:-0}"
+# Plan FORMAT reward (DEFAULT OFF): per-turn shaping bonus on advantage for a
+# well-formed Thought->Plan->Action turn (counters inline-plan decay under RL).
+# bonus_t = COEF*(score-BASELINE) on the turn's tokens; baseline 0.5 = symmetric.
+PLAN_FORMAT_REWARD_ENABLE="${PLAN_FORMAT_REWARD_ENABLE:-False}"
+PLAN_FORMAT_REWARD_COEF="${PLAN_FORMAT_REWARD_COEF:-0.05}"
+PLAN_FORMAT_REWARD_BASELINE="${PLAN_FORMAT_REWARD_BASELINE:-0.5}"
+PLAN_FORMAT_REWARD_CLIP="${PLAN_FORMAT_REWARD_CLIP:-0.0}"
+# penalty_only: only penalize turns that DROP the plan (never reward keeping it).
+PLAN_FORMAT_REWARD_PENALTY_ONLY="${PLAN_FORMAT_REWARD_PENALTY_ONLY:-True}"
+# warmup: keep format reward OFF until global_step >= this (learn task first).
+PLAN_FORMAT_REWARD_WARMUP_STEPS="${PLAN_FORMAT_REWARD_WARMUP_STEPS:-10}"
 # Block 1 (inline plan, DEFAULT OFF): append a standing instruction so the model
 # writes its next-K-action plan inside the THOUGHT each turn (auto-eats PG, the
 # env still parses Action:). Pairs with block 2 (plan_forecast) — same K/framing.
-PLAN_INLINE_ENABLE="${PLAN_INLINE_ENABLE:-True}"
+PLAN_INLINE_ENABLE="${PLAN_INLINE_ENABLE:-False}"
 PLAN_INLINE_K="${PLAN_INLINE_K:-${PLAN_FORECAST_K}}"
+# inline plan style: actions (next-K actions) | todo (checkable sub-goal TODO
+# list with (done) marks; pair with PLAN_FORECAST_TARGET=subgoal).
+PLAN_INLINE_STYLE="${PLAN_INLINE_STYLE:-actions}"
+# per-turn reminder: re-state the Plan request after EVERY obs (one-time decays).
+PLAN_INLINE_PER_TURN="${PLAN_INLINE_PER_TURN:-False}"   # ARCHIVED: per-turn reminder off; opening prompt only
+# inline warmup: use ORIGINAL prompt until global_step >= this, then introduce
+# the plan prompt (cold-start: let task competence build before planning).
+PLAN_INLINE_WARMUP_STEPS="${PLAN_INLINE_WARMUP_STEPS:-0}"
+# think reminder (alternative to inline plan, mutually exclusive): per-turn nudge
+# to reason in a Thought before the Action, WITHOUT forcing a Plan.
+THINK_REMINDER_ENABLE="${THINK_REMINDER_ENABLE:-False}"
 # HCA action-only ρ scoring: score on the action tokens (after the
 # delimiter) instead of the whole Thought+Action turn. Default OFF.
 
@@ -261,6 +300,10 @@ exec env \
     data.max_response_length="${MAX_RESPONSE_LENGTH}" \
     +data.plan_inline_enable="${PLAN_INLINE_ENABLE}" \
     +data.plan_inline_k="${PLAN_INLINE_K}" \
+    +data.plan_inline_style="${PLAN_INLINE_STYLE}" \
+    +data.plan_inline_per_turn="${PLAN_INLINE_PER_TURN}" \
+    +data.plan_inline_warmup_steps="${PLAN_INLINE_WARMUP_STEPS}" \
+    +data.think_reminder_enable="${THINK_REMINDER_ENABLE}" \
     actor_rollout_ref.agentgym.task_name="${TASK_NAME}" \
     actor_rollout_ref.agentgym.env_addr="'${ENV_ADDR}'" \
     actor_rollout_ref.agentgym.timeout=2400 \
@@ -291,6 +334,7 @@ exec env \
     trainer.default_local_dir="${CKPT_DIR}" \
     trainer.save_freq="${SAVE_FREQ}" \
     trainer.total_epochs="${TOTAL_EPOCHS}" \
+    trainer.total_training_steps="${TOTAL_TRAINING_STEPS}" \
     trainer.nnodes=1 \
     trainer.n_gpus_per_node="${NUM_GPUS}" \
     wmc_erc.enable="${ERC_ENABLE_VALUE}" \
@@ -362,6 +406,19 @@ exec env \
     +actor_rollout_ref.actor.plan_forecast_gate="${PLAN_FORECAST_GATE}" \
     +actor_rollout_ref.actor.plan_forecast_success_threshold="${PLAN_FORECAST_SUCCESS_THRESHOLD}" \
     +actor_rollout_ref.actor.plan_forecast_max_length="${PLAN_FORECAST_MAX_LENGTH}" \
+    +actor_rollout_ref.actor.plan_forecast_target="${PLAN_FORECAST_TARGET}" \
+    +actor_rollout_ref.actor.plan_forecast_seq="${PLAN_FORECAST_SEQ}" \
+    +actor_rollout_ref.actor.plan_forecast_coef_anneal="${PLAN_FORECAST_COEF_ANNEAL}" \
+    +actor_rollout_ref.actor.plan_forecast_coef_end="${PLAN_FORECAST_COEF_END}" \
+    +actor_rollout_ref.actor.plan_forecast_coef_horizon="${PLAN_FORECAST_COEF_HORIZON}" \
+    +actor_rollout_ref.actor.plan_forecast_coef_power="${PLAN_FORECAST_COEF_POWER}" \
+    +actor_rollout_ref.actor.plan_forecast_coef_cutoff_step="${PLAN_FORECAST_COEF_CUTOFF_STEP}" \
+    +actor_rollout_ref.actor.plan_format_reward_enable="${PLAN_FORMAT_REWARD_ENABLE}" \
+    +actor_rollout_ref.actor.plan_format_reward_coef="${PLAN_FORMAT_REWARD_COEF}" \
+    +actor_rollout_ref.actor.plan_format_reward_baseline="${PLAN_FORMAT_REWARD_BASELINE}" \
+    +actor_rollout_ref.actor.plan_format_reward_clip="${PLAN_FORMAT_REWARD_CLIP}" \
+    +actor_rollout_ref.actor.plan_format_reward_penalty_only="${PLAN_FORMAT_REWARD_PENALTY_ONLY}" \
+    +actor_rollout_ref.actor.plan_format_reward_warmup_steps="${PLAN_FORMAT_REWARD_WARMUP_STEPS}" \
     actor_rollout_ref.actor.world_model_coeff="${WMC_COEFF}" \
     actor_rollout_ref.actor.world_model.enable="${WM_ENABLE}" \
     actor_rollout_ref.actor.world_model.env_predict_prompt="${WM_ENV_PREDICT_PROMPT}" \
