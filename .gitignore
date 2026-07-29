@@ -10,3 +10,16 @@ core.*
 tmp_eval/
 **/core.*
 **/tmp_eval/
+
+# experiment outputs / runtime junk
+runs/
+data/
+__pycache__/
+*.pyc
+.*_jid
+hs_err_pid*.log
+.gpu_bridge/run/
+.gpu_bridge/queue/
+.gpu_bridge/jobs/
+.gpu_bridge/logs/
+.gpu_bridge/kill/

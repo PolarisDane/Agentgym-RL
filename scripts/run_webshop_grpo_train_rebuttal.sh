@@ -67,7 +67,7 @@ ERC_ETA_WM="${ERC_ETA_WM:-2.0}"
 ERC_LAMBDA_WM="${ERC_LAMBDA_WM:-1.0}"
 ERC_CLIPPING_TYPE="${ERC_CLIPPING_TYPE:-global}"
 ERC_CLIPPING_METHOD="${ERC_CLIPPING_METHOD:-add}"
-ERC_MOMENTUM="${ERC_MOMENTUM:-0.8}"
+ERC_MOMENTUM="${ERC_MOMENTUM:-0.5}"
 # Uncertainty-scaling (set ERC_CLIPPING_METHOD=uncertainty_scale to use):
 # shrink advantage on turns with high next-obs env entropy (model unsure
 # what its action causes) to prevent action-entropy collapse there.
@@ -164,8 +164,8 @@ PE_CLF_ENV="${PE_CLF_ENV:-webshop}"
 # Plan-forecast auxiliary SFT (DEFAULT OFF): each step predict the realized next-K
 # action commands (current included). Separate forward, CE loss * coef, no PG.
 # gate=wins -> only winning trajectories; gate=all -> every trajectory.
-PLAN_FORECAST_ENABLE="${PLAN_FORECAST_ENABLE:-True}"
-PLAN_FORECAST_COEF="${PLAN_FORECAST_COEF:-0.01}"
+PLAN_FORECAST_ENABLE="${PLAN_FORECAST_ENABLE:-False}"
+PLAN_FORECAST_COEF="${PLAN_FORECAST_COEF:-0}"
 PLAN_FORECAST_K="${PLAN_FORECAST_K:-3}"
 PLAN_FORECAST_GATE="${PLAN_FORECAST_GATE:-wins}"
 # --- Two ORTHOGONAL group knobs (compose; both distill successes only) ---
@@ -259,7 +259,7 @@ WM_MAX_LENGTH="${WM_MAX_LENGTH:-4096}"
 WM_MAX_SAMPLES_PER_TRAJECTORY="${WM_MAX_SAMPLES_PER_TRAJECTORY:-null}"
 WM_MIN_ENV_TOKENS="${WM_MIN_ENV_TOKENS:-1}"
 
-EXP_NAME="${EXP_NAME:-webshop_grpo_qwen2.5_3b_$(date -u +%Y%m%d_%H%M%S)}"
+EXP_NAME="${EXP_NAME:-webshop_grpo_reb_r2_$(date -u +%Y%m%d_%H%M%S)}"
 CKPT_DIR="${CKPT_DIR:-${ROOT}/checkpoints/${EXP_NAME}}"
 RUN_DIR="${RUN_DIR:-${ROOT}/runlogs/${EXP_NAME}}"
 ROLLOUT_LOG_DIR="${ROLLOUT_LOG_DIR:-${RUN_DIR}/rollout_logs}"

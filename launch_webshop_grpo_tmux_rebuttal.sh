@@ -21,7 +21,7 @@ export HF_HUB_OFFLINE=1
 export WANDB_MODE=offline
 
 RUN_TS="$(date -u +%Y%m%d_%H%M%S)"
-EXP_NAME="${EXP_NAME:-webshop_grpo_qwen2.5_3b_add_${RUN_TS}}"
+EXP_NAME="${EXP_NAME:-webshop_grpo_reb_baseline_prolong_${RUN_TS}}"
 
 ENV_SESSION="webshop_env_cluster_${BASE_PORT}"
 TRAIN_SESSION="webshop_grpo_train"
@@ -61,7 +61,7 @@ done
 echo "Starting GRPO Training..."
 # Forward tuning env vars into the training tmux command, but only those that
 # are actually set in this shell — unset ones fall through to the defaults in
-# run_webshop_grpo_train.sh.
+# run_webshop_grpo_train_rebuttal.sh.
 FWD=""
 for v in ENABLE_ERC ERC_CLIPPING_METHOD ERC_CLIPPING_TYPE ERC_MOMENTUM UNCERTAINTY_SCALE_KAPPA UNCERTAINTY_SCALE_MIN UNCERTAINTY_SCALE_RENORMALIZE SAFE_COMMIT_MODE SAFE_COMMIT_OMEGA SAFE_COMMIT_RECENCY SAFE_COMMIT_RECENCY_GAMMA SAFE_COMMIT_SUCCESS_THRESHOLD SAFE_COMMIT_KAPPA SAFE_COMMIT_GMAX SAFE_COMMIT_GMIN SAFE_COMMIT_RENORMALIZE SAFE_COMMIT_TEXT_GATE SAFE_COMMIT_GATE_MODE SAFE_COMMIT_CLF_ENV SAFE_COMMIT_CLF_WINS_ONLY SAFE_COMMIT_CLF_MAX_NEW \
          WMLOSS_ADD_COEF WMLOSS_ADD_COEF_END WMLOSS_ADD_HORIZON \
@@ -75,7 +75,7 @@ for v in ENABLE_ERC ERC_CLIPPING_METHOD ERC_CLIPPING_TYPE ERC_MOMENTUM UNCERTAIN
 done
 echo "Forwarding overrides:${FWD:-<none>}"
 tmux new-session -d -s "${TRAIN_SESSION}" \
-  "cd ${ROOT} && CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} NUM_ENVS=${NUM_ENVS} ENVS_PER_GPU=${ENVS_PER_GPU} BASE_PORT=${BASE_PORT} MODEL_PATH=${MODEL_PATH} WANDB_MODE=${WANDB_MODE} PROJECT_NAME=${PROJECT_NAME} EXP_NAME=${EXP_NAME} LOG_PATH=${TRAIN_LOG}${FWD} bash ${ROOT}/scripts/run_webshop_grpo_train.sh"
+  "cd ${ROOT} && CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} NUM_ENVS=${NUM_ENVS} ENVS_PER_GPU=${ENVS_PER_GPU} BASE_PORT=${BASE_PORT} MODEL_PATH=${MODEL_PATH} WANDB_MODE=${WANDB_MODE} PROJECT_NAME=${PROJECT_NAME} EXP_NAME=${EXP_NAME} LOG_PATH=${TRAIN_LOG}${FWD} bash ${ROOT}/scripts/run_webshop_grpo_train_rebuttal.sh"
 
 echo "--------------------------------------------------"
 echo "WebShop Training Cluster Launched!"

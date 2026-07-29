@@ -1,4 +1,5 @@
 from contextlib import contextmanager
+import itertools
 import os
 import time
 from agentenv.envs import (
@@ -21,22 +22,43 @@ from agentenv.envs import (
 
 import torch.distributed as dist
 
+_ADDR_RR = itertools.count()   # round-robin cursor within this rank's server shard
+
+
 def _select_env_addr(env_addr_value):
-    """
-    Selects an environment address from a comma-separated list based on the distributed rank.
+    """Pick an env-server address for ONE env client, sharded by distributed rank.
+
+    A rank opens (batch_per_rank * rollout_n) env clients per rollout, all of which
+    step concurrently. The old logic gave every rank a single address, so all of that
+    concurrency funnelled into one server process -- and since env.step is pure-Python
+    behind a sync FastAPI endpoint, the GIL serialised it and left most cores idle.
+
+    Now each rank gets a CONTIGUOUS SHARD of the address list (len(addrs)//world_size
+    servers) and its clients round-robin over that shard, so one GPU's env stepping
+    spreads across several server processes / cores.
+
+    Backward compatible: when len(addrs) == world_size the shard is exactly one
+    address, reproducing the previous addrs[rank % len(addrs)] behaviour.
     """
     addrs = [a.strip() for a in str(env_addr_value).split(",") if a.strip()]
     if len(addrs) <= 1:
         return addrs[0] if addrs else env_addr_value
-    
-    # Select address based on rank to distribute load across multiple servers
+
     if dist.is_initialized():
-        rank = dist.get_rank()
+        rank, world_size = dist.get_rank(), dist.get_world_size()
     else:
         rank = int(os.environ.get("RANK", 0))
-    
-    selected_addr = addrs[rank % len(addrs)]
-    print(f"[Rank {rank}] Selected env_addr: {selected_addr}")
+        world_size = int(os.environ.get("WORLD_SIZE", 1))
+    world_size = max(1, world_size)
+
+    per_rank = len(addrs) // world_size
+    if per_rank >= 1:
+        shard = addrs[rank * per_rank:(rank + 1) * per_rank]
+    else:
+        # fewer servers than ranks -> fall back to sharing (old behaviour)
+        shard = [addrs[rank % len(addrs)]]
+
+    selected_addr = shard[next(_ADDR_RR) % len(shard)]
     return selected_addr
 
 def init_env_client(args):

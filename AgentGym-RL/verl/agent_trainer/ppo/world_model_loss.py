@@ -185,12 +185,17 @@ def collate_world_model_samples(
 
     position_ids = (torch.cumsum(attention_mask, dim=-1) - 1).clamp(min=0)
 
-    return {
+    out = {
         'input_ids': input_ids,
         'attention_mask': attention_mask,
         'position_ids': position_ids,
         'loss_mask': loss_mask,
     }
+    # optional per-sample loss weight (e.g. plan-forecast group-weight normalization)
+    if any('loss_weight' in s for s in samples):
+        out['loss_weight'] = torch.tensor(
+            [float(s.get('loss_weight', 1.0)) for s in samples], dtype=torch.float32)
+    return out
 
 
 def build_world_model_sft_batch(
@@ -225,6 +230,72 @@ def build_world_model_sft_batch(
     )
 
 
+def build_world_model_placebo_batch(
+    messages_list,
+    tokenizer: PreTrainedTokenizer,
+    env_predict_prompt: str = DEFAULT_WORLD_MODEL_PROMPT,
+    max_length: int = 4096,
+    max_samples_per_trajectory: Optional[int] = None,
+    min_env_tokens: int = 1,
+    seed: int = 0,
+) -> Optional[Dict[str, torch.Tensor]]:
+    """C3 PLACEBO for the WM-SFT value experiment: identical transitions as
+    ``build_world_model_sft_batch`` (same prefixes, same per-traj cap, same count),
+    but each prefix's target observation is REPLACED by another transition's
+    observation (a derangement). Same token budget / loss shape / gradient
+    magnitude, but NO real env-dynamics signal — so C2 (real WM) minus C3 (this)
+    isolates the world-model contribution from a generic 'dense obs-token gradient'
+    confound. Deterministic given ``seed`` (pass global_step). Reuses the exact
+    plan-forecast encoder so encoding matches the real path."""
+    from verl.agent_trainer.ppo.plan_forecast import encode_sft_sample
+    import random as _random
+
+    # Collect (prefix_msgs, obs_content) transitions, mirroring the real builder's
+    # per-trajectory selection (keep-last cap) so the sample COUNT matches C2.
+    pairs = []
+    for messages in messages_list:
+        if messages is None:
+            continue
+        convo = _to_chat_list(messages)
+        traj = []
+        for idx, msg in enumerate(convo):
+            if msg['role'] != 'user':
+                continue
+            if not any(m['role'] == 'assistant' for m in convo[:idx]):
+                continue
+            prefix = list(convo[:idx]) + [{'role': 'user', 'content': env_predict_prompt}]
+            traj.append((prefix, msg['content']))
+        if max_samples_per_trajectory is not None and len(traj) > max_samples_per_trajectory:
+            traj = traj[-max_samples_per_trajectory:]
+        pairs.extend(traj)
+
+    if len(pairs) < 2:
+        return None
+
+    obs_list = [p[1] for p in pairs]
+    perm = list(range(len(obs_list)))
+    _random.Random(seed).shuffle(perm)
+    for i in range(len(perm)):          # break any fixed points -> true wrong obs
+        if perm[i] == i:
+            j = (i + 1) % len(perm)
+            perm[i], perm[j] = perm[j], perm[i]
+
+    samples = []
+    for i, (prefix, _real) in enumerate(pairs):
+        wrong_obs = obs_list[perm[i]]
+        s = encode_sft_sample(tokenizer, prefix,
+                              [{'role': 'assistant', 'content': wrong_obs}],
+                              max_length=max_length, min_target_tokens=min_env_tokens)
+        if s is not None:
+            samples.append(s)
+
+    return collate_world_model_samples(
+        samples=samples,
+        pad_token_id=tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0,
+        max_length=max_length,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Cross-entropy SFT loss on the assembled batch.
 # ---------------------------------------------------------------------------
@@ -239,14 +310,36 @@ def compute_world_model_sft_loss_from_logits(
     """
     shift_logits = logits[:, :-1, :].contiguous()
     shift_labels = labels[:, 1:].contiguous()
-    shift_mask = loss_mask[:, 1:].contiguous().to(shift_logits.dtype)
+    shift_mask = loss_mask[:, 1:].contiguous().to(torch.bool)
 
     vocab = shift_logits.size(-1)
-    loss_fn = torch.nn.CrossEntropyLoss(reduction='none')
-    tok_loss = loss_fn(shift_logits.view(-1, vocab), shift_labels.view(-1))
-    tok_loss = tok_loss.view(shift_labels.shape) * shift_mask
+    # ignore_index on the non-supervised positions so CrossEntropyLoss does NOT
+    # evaluate them at all. (The old "compute CE everywhere then multiply by mask"
+    # form risked inf*0 = NaN if a padded/ignored position's logits were non-finite.)
+    ignored_labels = shift_labels.masked_fill(~shift_mask, -100)
+    loss_fn = torch.nn.CrossEntropyLoss(reduction='none', ignore_index=-100)
+    tok_loss = loss_fn(shift_logits.view(-1, vocab), ignored_labels.view(-1))
+    tok_loss = tok_loss.view(shift_labels.shape)   # ignored positions already 0
     denom = shift_mask.sum().clamp(min=1.0)
     return tok_loss.sum() / denom
+
+
+def compute_traj_lm_loss(log_prob, response_mask, obs_mask, row_mask=None):
+    """Full-sequence next-token CE over the ENTIRE trajectory response region —
+    BOTH the agent's own tokens (``response_mask``) AND the env observation tokens
+    (``obs_mask``), no distinction. = plain LM SFT on the whole rollout. Uses the
+    already-computed ``log_prob`` (response-region token log-probs), so it is a mask
+    swap over the same forward as the PG/WM terms. MUTUALLY EXCLUSIVE with WM-SFT
+    (which is obs-only) — the trainer asserts this.
+
+    ``row_mask`` (optional, shape [B]): per-trajectory 0/1 keep-mask for
+    gate='wins' — zero out whole trajectories we don't want to clone (e.g. losing
+    ones). None = keep all (gate='all'). Returns the scalar CE (0 if nothing kept)."""
+    full = (response_mask.bool() | obs_mask.bool()).to(log_prob.dtype)
+    if row_mask is not None:
+        full = full * row_mask.to(full.dtype).unsqueeze(-1)
+    denom = full.sum().clamp(min=1.0)
+    return -(log_prob * full).sum() / denom
 
 
 # Backward-compat alias used by the earlier inline implementation: compute

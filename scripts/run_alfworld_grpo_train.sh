@@ -38,7 +38,7 @@ WANDB_MODE="${WANDB_MODE:-offline}"
 PROJECT_NAME="${PROJECT_NAME:-agentgym-alfworld}"
 
 KL_COEF="${KL_COEF:-0.001}"
-ENTROPY_COEF="${ENTROPY_COEF:-0.001}"
+ENTROPY_COEF="${ENTROPY_COEF:-0.002}"
 POLICY_LR="${POLICY_LR:-1e-6}"
 ROLLOUT_N="${ROLLOUT_N:-8}"
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-16}"
@@ -54,7 +54,7 @@ MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-1024}"
 MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-8192}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-8192}"
 MAX_TOKENS_PER_TURN="${MAX_TOKENS_PER_TURN:-512}"
-ROLLOUT_GPU_MEMORY_UTILIZATION="${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.80}"
+ROLLOUT_GPU_MEMORY_UTILIZATION="${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.70}"
 SAVE_FREQ="${SAVE_FREQ:-25}"
 
 ENABLE_ERC="${ENABLE_ERC:-0}"
@@ -193,7 +193,35 @@ PE_CLF_ENV="${PE_CLF_ENV:-alfworld}"
 PLAN_FORECAST_ENABLE="${PLAN_FORECAST_ENABLE:-True}"
 PLAN_FORECAST_COEF="${PLAN_FORECAST_COEF:-0.01}"
 PLAN_FORECAST_K="${PLAN_FORECAST_K:-3}"
-PLAN_FORECAST_GATE="${PLAN_FORECAST_GATE:-all}"
+# Horizon-growth schedule (curriculum): grow the forecast target length over
+# training. Format "startStep:kMin:kMax,..." (start-step semantics, last stage
+# persists); each per-step sample draws k uniformly in the active [kMin,kMax] and
+# the prompt/plan-block align to the realized length. Empty = OFF (use PLAN_FORECAST_K).
+# First stage MUST start at 0. Example: "0:2:3,40:2:4,80:3:5".
+PLAN_FORECAST_K_SCHEDULE="${PLAN_FORECAST_K_SCHEDULE:-}"
+# skip_invalid: build the forecast target from only EFFECTIVE actions — drop actions
+# whose env result was invalid / no-effect ("Nothing happens." / "Invalid Action." /
+# "No known action..."; per-env, auto-selected by task_name). Default off.
+PLAN_FORECAST_SKIP_INVALID="${PLAN_FORECAST_SKIP_INVALID:-True}"
+# gate=wins: forecast-SFT only on winning trajectories (block2-success, proven).
+PLAN_FORECAST_GATE="${PLAN_FORECAST_GATE:-wins}"
+# --- Two ORTHOGONAL group knobs (compose; both distill successes only) ---
+# Group-success GATING (curriculum): filter WHICH groups' successes to distill by the
+# group's success-rate. off (use PLAN_FORECAST_GATE) | low (rate<=LOW) | low_high
+# (rate<=LOW OR >=HIGH, skip mid-rate groups where GRPO signal is strong). Default off.
+PLAN_FORECAST_GROUP_GATE="${PLAN_FORECAST_GROUP_GATE:-off}"
+PLAN_FORECAST_GROUP_LOW_THRESH="${PLAN_FORECAST_GROUP_LOW_THRESH:-0.5}"
+PLAN_FORECAST_GROUP_HIGH_THRESH="${PLAN_FORECAST_GROUP_HIGH_THRESH:-1.0}"
+# Group-weight NORMALIZATION (stability): give every kept GRPO group the SAME total
+# plan-CE weight = the single PLAN_FORECAST_COEF, split EVENLY among its distilled
+# successful trajectories. As success-rate rises mid/late training, per-traj weight
+# shrinks and each group's contribution stays constant -> no SFT blow-up from more
+# successful samples. Applies to whatever gating keeps.
+PLAN_FORECAST_GROUP_NORM="${PLAN_FORECAST_GROUP_NORM:-True}"
+# group_dedup (default True): when group_norm on, split each group's weight over its
+# DISTINCT successful action-sequences instead of per-trajectory -> duplicate rollouts
+# don't inflate weight (within-group action repetition is heavy mid/late training).
+PLAN_FORECAST_GROUP_DEDUP="${PLAN_FORECAST_GROUP_DEDUP:-False}"
 PLAN_FORECAST_SUCCESS_THRESHOLD="${PLAN_FORECAST_SUCCESS_THRESHOLD:-0.5}"
 PLAN_FORECAST_MAX_LENGTH="${PLAN_FORECAST_MAX_LENGTH:-4096}"
 # plan_forecast target: action (predict realized next-K actions; block2-success,
@@ -207,9 +235,16 @@ PLAN_FORECAST_SEQ="${PLAN_FORECAST_SEQ:-separate}"
 # plan_forecast_coef anneal: fixed | linear | power | cutoff (start = PLAN_FORECAST_COEF).
 PLAN_FORECAST_COEF_ANNEAL="${PLAN_FORECAST_COEF_ANNEAL:-fixed}"
 PLAN_FORECAST_COEF_END="${PLAN_FORECAST_COEF_END:-0.0}"
-PLAN_FORECAST_COEF_HORIZON="${PLAN_FORECAST_COEF_HORIZON:-25}"
+PLAN_FORECAST_COEF_HORIZON="${PLAN_FORECAST_COEF_HORIZON:-40}"
 PLAN_FORECAST_COEF_POWER="${PLAN_FORECAST_COEF_POWER:-2.0}"
 PLAN_FORECAST_COEF_CUTOFF_STEP="${PLAN_FORECAST_COEF_CUTOFF_STEP:-0}"
+# SFT-ablation (RFT) control — MUTUALLY EXCLUSIVE with plan_forecast (asserted at
+# init). When ON: one extra SFT round behavior-cloning THIS step's winning trajs'
+# real assistant turns (vs plan_forecast's constructed forecast target). Same
+# optimizer path + win-gate; toggle only these two for a clean A/B. DEFAULT OFF.
+SFT_ABLATION_ENABLE="${SFT_ABLATION_ENABLE:-False}"
+SFT_ABLATION_COEF="${SFT_ABLATION_COEF:-0.01}"      # match PLAN_FORECAST_COEF for a fair control
+SFT_ABLATION_GATE="${SFT_ABLATION_GATE:-wins}"      # wins (success trajs only) | all
 # Plan FORMAT reward (DEFAULT OFF): per-turn shaping bonus on advantage for a
 # well-formed Thought->Plan->Action turn (counters inline-plan decay under RL).
 # bonus_t = COEF*(score-BASELINE) on the turn's tokens; baseline 0.5 = symmetric.
@@ -240,7 +275,16 @@ THINK_REMINDER_ENABLE="${THINK_REMINDER_ENABLE:-False}"
 # HCA action-only ρ scoring: score on the action tokens (after the
 # delimiter) instead of the whole Thought+Action turn. Default OFF.
 
-WMC_COEFF="${WMC_COEFF:-0.01}"
+WMC_COEFF="${WMC_COEFF:-0}"
+# traj_lm: full-sequence next-token CE over the WHOLE trajectory (env obs AND the
+# agent's own tokens), coef>0 = on. MUTUALLY EXCLUSIVE with WM-SFT (asserted at init):
+# don't set this together with WMC_COEFF>0 or WM_ENABLE=True. Default 0 = off.
+TRAJ_LM_COEF="${TRAJ_LM_COEF:-0}"
+# traj_lm trajectory gate: all (clone every rollout, default = old behavior) |
+# wins (only clone trajectories with GRPO advantage>0, i.e. better than group mean).
+# 'all' BC's losing behavior too -> anchors policy to base & slows early learning;
+# 'wins' is recommended (mirrors block2 forecast's gate=wins).
+TRAJ_LM_GATE="${TRAJ_LM_GATE:-wins}"
 WMC_TYPE="${WMC_TYPE:-fixed}"
 WMC_START_COEFF="${WMC_START_COEFF:-0.001}"
 WMC_END_COEFF="${WMC_END_COEFF:-0.0}"
@@ -249,6 +293,13 @@ WMC_POWER="${WMC_POWER:-2}"
 WMC_CUTOFF_STEP="${WMC_CUTOFF_STEP:-50}"
 
 WM_ENABLE="${WM_ENABLE:-False}"
+# C3 placebo (WM-value experiment): shuffle obs targets so WM-SFT gets same dense
+# gradient with NO real dynamics signal. DEFAULT False = normal WM-SFT. Only meaningful
+# when WM-SFT is active (WMC_COEFF>0 or WM_ENABLE=True).
+WM_PLACEBO_SHUFFLE="${WM_PLACEBO_SHUFFLE:-False}"
+# Separate WM-SFT pass strength, decoupled from the inline WMC_COEFF. Set >0 (and
+# WM_ENABLE=True, WMC_COEFF=0) to run the separate WM-SFT alone (WM-value experiment).
+WM_SFT_COEF="${WM_SFT_COEF:-0.0}"
 WM_LOSS_PI_DEDUP="${WM_LOSS_PI_DEDUP:-True}"
 
 WM_ENV_PREDICT_PROMPT="${WM_ENV_PREDICT_PROMPT:-null}"
@@ -403,7 +454,14 @@ exec env \
     +actor_rollout_ref.actor.plan_forecast_enable="${PLAN_FORECAST_ENABLE}" \
     +actor_rollout_ref.actor.plan_forecast_coef="${PLAN_FORECAST_COEF}" \
     +actor_rollout_ref.actor.plan_forecast_k="${PLAN_FORECAST_K}" \
+    +actor_rollout_ref.actor.plan_forecast_k_schedule="'${PLAN_FORECAST_K_SCHEDULE}'" \
+    +actor_rollout_ref.actor.plan_forecast_skip_invalid="${PLAN_FORECAST_SKIP_INVALID}" \
     +actor_rollout_ref.actor.plan_forecast_gate="${PLAN_FORECAST_GATE}" \
+    +actor_rollout_ref.actor.plan_forecast_group_gate="${PLAN_FORECAST_GROUP_GATE}" \
+    +actor_rollout_ref.actor.plan_forecast_group_low_thresh="${PLAN_FORECAST_GROUP_LOW_THRESH}" \
+    +actor_rollout_ref.actor.plan_forecast_group_high_thresh="${PLAN_FORECAST_GROUP_HIGH_THRESH}" \
+    +actor_rollout_ref.actor.plan_forecast_group_norm="${PLAN_FORECAST_GROUP_NORM}" \
+    +actor_rollout_ref.actor.plan_forecast_group_dedup="${PLAN_FORECAST_GROUP_DEDUP}" \
     +actor_rollout_ref.actor.plan_forecast_success_threshold="${PLAN_FORECAST_SUCCESS_THRESHOLD}" \
     +actor_rollout_ref.actor.plan_forecast_max_length="${PLAN_FORECAST_MAX_LENGTH}" \
     +actor_rollout_ref.actor.plan_forecast_target="${PLAN_FORECAST_TARGET}" \
@@ -413,6 +471,9 @@ exec env \
     +actor_rollout_ref.actor.plan_forecast_coef_horizon="${PLAN_FORECAST_COEF_HORIZON}" \
     +actor_rollout_ref.actor.plan_forecast_coef_power="${PLAN_FORECAST_COEF_POWER}" \
     +actor_rollout_ref.actor.plan_forecast_coef_cutoff_step="${PLAN_FORECAST_COEF_CUTOFF_STEP}" \
+    +actor_rollout_ref.actor.sft_ablation_enable="${SFT_ABLATION_ENABLE}" \
+    +actor_rollout_ref.actor.sft_ablation_coef="${SFT_ABLATION_COEF}" \
+    +actor_rollout_ref.actor.sft_ablation_gate="${SFT_ABLATION_GATE}" \
     +actor_rollout_ref.actor.plan_format_reward_enable="${PLAN_FORMAT_REWARD_ENABLE}" \
     +actor_rollout_ref.actor.plan_format_reward_coef="${PLAN_FORMAT_REWARD_COEF}" \
     +actor_rollout_ref.actor.plan_format_reward_baseline="${PLAN_FORMAT_REWARD_BASELINE}" \
@@ -420,7 +481,11 @@ exec env \
     +actor_rollout_ref.actor.plan_format_reward_penalty_only="${PLAN_FORMAT_REWARD_PENALTY_ONLY}" \
     +actor_rollout_ref.actor.plan_format_reward_warmup_steps="${PLAN_FORMAT_REWARD_WARMUP_STEPS}" \
     actor_rollout_ref.actor.world_model_coeff="${WMC_COEFF}" \
+    +actor_rollout_ref.actor.traj_lm_coef="${TRAJ_LM_COEF}" \
+    +actor_rollout_ref.actor.traj_lm_gate="${TRAJ_LM_GATE}" \
     actor_rollout_ref.actor.world_model.enable="${WM_ENABLE}" \
+    +actor_rollout_ref.actor.world_model.placebo_shuffle="${WM_PLACEBO_SHUFFLE}" \
+    +actor_rollout_ref.actor.world_model.sft_coef="${WM_SFT_COEF}" \
     actor_rollout_ref.actor.world_model.env_predict_prompt="${WM_ENV_PREDICT_PROMPT}" \
     actor_rollout_ref.actor.world_model.max_length="${WM_MAX_LENGTH}" \
     actor_rollout_ref.actor.world_model.max_samples_per_trajectory="${WM_MAX_SAMPLES_PER_TRAJECTORY}" \

@@ -28,6 +28,7 @@ from verl.agent_trainer.ppo.world_model_loss import (
     compute_world_model_loss,
     compute_world_model_sft_loss_from_logits,
     compute_observation_mask,
+    compute_traj_lm_loss,
 )
 from verl.workers.agent_actor import BasePPOActor
 from verl.utils.py_functional import append_to_dict
@@ -223,6 +224,14 @@ class DataParallelPPOActor(BasePPOActor):
             grad_norm = self.actor_module.clip_grad_norm_(max_norm=self.config.grad_clip)
         else:
             grad_norm = torch.nn.utils.clip_grad_norm_(self.actor_module.parameters(), max_norm=self.config.grad_clip)
+        # Skip the update when grad_norm is non-finite (NaN/inf). Stepping the optimizer
+        # with a non-finite gradient permanently corrupts the weights -- a single bad
+        # step yields irreversible policy collapse (outputs degenerate, reward -> 0).
+        # Zero the poisoned grads so they cannot linger into the next accumulation.
+        if not torch.isfinite(grad_norm):
+            print(f"[optimizer_step] non-finite grad_norm ({grad_norm}); skipping optimizer.step()", flush=True)
+            self.actor_optimizer.zero_grad()
+            return grad_norm
         self.actor_optimizer.step()
         return grad_norm
 
@@ -414,7 +423,9 @@ class DataParallelPPOActor(BasePPOActor):
         select_keys = ['input_ids', 'attention_mask', 'position_ids', 'old_log_probs', 'advantages', 'responses', 'response_mask']
         if self.config.use_kl_loss:
             select_keys.append('ref_log_prob')
-        if world_model_coeff > 0 and 'observation_mask' in data.batch.keys():
+        # Select observation_mask whenever present so wm_sft_loss can be computed
+        # for LOGGING even when world_model_coeff == 0 (observe-only, no gradient).
+        if 'observation_mask' in data.batch.keys():
             select_keys.append('observation_mask')
         batch = data.select(batch_keys=select_keys).batch
 
@@ -471,57 +482,76 @@ class DataParallelPPOActor(BasePPOActor):
                     metrics['actor/kl_loss'] = kl_loss.detach().item()
                     metrics['actor/kl_coef'] = self.config.kl_loss_coef
 
-                # Legacy in-place world-model SFT term: only fires when the
-                # batch carries an explicit ``observation_mask`` (e.g. tests or
-                # callers that still mask env tokens on the rollout sequence).
-                # The recommended path is the separate ``update_world_model``
-                # pass driven by ``ray_trainer.fit`` on a freshly re-assembled
-                # chat-template batch.
-                if world_model_coeff > 0:
-                    explicit_observation_mask = data.get('observation_mask', None)
-                    
-                    if self.config.get('wm_loss_pi_dedup', False):
-                        obs_mask = compute_observation_mask(
-                            attention_mask=data['attention_mask'],
-                            response_mask=response_mask,
-                            observation_mask=explicit_observation_mask)
-                        
-                        if obs_mask.any().item():
-                            olp = data['old_log_probs'].detach()
-                            t_ids = compute_turn_ids(response_mask)
-                            n_total = int(t_ids.max().item()) + 1 if t_ids.numel() else 1
-                            B = response_mask.size(0)
-                            dt = log_prob.dtype
-                            rm_f = response_mask.to(dt)
-                            
-                            log_pi_sum = torch.zeros(B, n_total, device=olp.device, dtype=dt)
-                            n_act = torch.zeros_like(log_pi_sum)
-                            log_pi_sum.scatter_add_(1, t_ids, olp.to(dt) * rm_f)
-                            n_act.scatter_add_(1, t_ids, rm_f)
-                            
-                            log_pi_mean = log_pi_sum / n_act.clamp(min=1.0)
-                            pi_per_turn = log_pi_mean.exp().clamp(0.0, 1.0)
-                            w_per_turn = (1.0 - pi_per_turn)  # ∈ [0, 1]
-                            w_per_token = w_per_turn.gather(1, t_ids).to(dt)
-                            
-                            obs_mask_w = obs_mask.to(dt) * w_per_token
-                            denom = obs_mask_w.sum().clamp(min=1e-6)
-                            wm_sft_loss = -(log_prob * obs_mask_w).sum() / denom
-                            metrics['actor/wm_sft_pi_dedup_w_mean'] = w_per_turn.mean().detach().item()
-                        else:
-                            wm_sft_loss = None
-                    else:
-                        wm_sft_loss, _ = compute_world_model_loss(
-                            log_prob=log_prob,
-                            attention_mask=data['attention_mask'],
-                            response_mask=response_mask,
-                            observation_mask=explicit_observation_mask,
-                        )
+                # World-model SFT term. Computed for LOGGING regardless of
+                # world_model_coeff (so actor/wm_sft_loss is observable even when
+                # the coeff is 0), but only folded into the gradient when coeff > 0.
+                # The recommended path is the separate ``update_world_model`` pass
+                # driven by ``ray_trainer.fit`` on a re-assembled chat-template batch.
+                explicit_observation_mask = data.get('observation_mask', None)
+                wm_sft_loss = None
+                if self.config.get('wm_loss_pi_dedup', False):
+                    obs_mask = compute_observation_mask(
+                        attention_mask=data['attention_mask'],
+                        response_mask=response_mask,
+                        observation_mask=explicit_observation_mask)
 
-                    if wm_sft_loss is not None:
+                    if obs_mask.any().item():
+                        olp = data['old_log_probs'].detach()
+                        t_ids = compute_turn_ids(response_mask)
+                        n_total = int(t_ids.max().item()) + 1 if t_ids.numel() else 1
+                        B = response_mask.size(0)
+                        dt = log_prob.dtype
+                        rm_f = response_mask.to(dt)
+
+                        log_pi_sum = torch.zeros(B, n_total, device=olp.device, dtype=dt)
+                        n_act = torch.zeros_like(log_pi_sum)
+                        log_pi_sum.scatter_add_(1, t_ids, olp.to(dt) * rm_f)
+                        n_act.scatter_add_(1, t_ids, rm_f)
+
+                        log_pi_mean = log_pi_sum / n_act.clamp(min=1.0)
+                        pi_per_turn = log_pi_mean.exp().clamp(0.0, 1.0)
+                        w_per_turn = (1.0 - pi_per_turn)  # ∈ [0, 1]
+                        w_per_token = w_per_turn.gather(1, t_ids).to(dt)
+
+                        obs_mask_w = obs_mask.to(dt) * w_per_token
+                        denom = obs_mask_w.sum().clamp(min=1e-6)
+                        wm_sft_loss = -(log_prob * obs_mask_w).sum() / denom
+                        metrics['actor/wm_sft_pi_dedup_w_mean'] = w_per_turn.mean().detach().item()
+                else:
+                    wm_sft_loss, _ = compute_world_model_loss(
+                        log_prob=log_prob,
+                        attention_mask=data['attention_mask'],
+                        response_mask=response_mask,
+                        observation_mask=explicit_observation_mask,
+                    )
+
+                if wm_sft_loss is not None:
+                    metrics['actor/wm_sft_loss'] = wm_sft_loss.detach().item()
+                    metrics['actor/world_model_coeff'] = world_model_coeff
+                    if world_model_coeff > 0:
                         policy_loss = policy_loss + world_model_coeff * wm_sft_loss
-                        metrics['actor/wm_sft_loss'] = wm_sft_loss.detach().item()
-                        metrics['actor/world_model_coeff'] = world_model_coeff
+
+                # Full-trajectory LM SFT: next-token CE over the WHOLE response region
+                # (obs tokens AND the agent's own tokens), no masking. Mutually
+                # exclusive with WM-SFT (asserted at trainer init). Default off.
+                traj_lm_coef = float(self.config.get('traj_lm_coef', 0.0))
+                if traj_lm_coef > 0:
+                    _obs_mask = compute_observation_mask(
+                        attention_mask=data['attention_mask'],
+                        response_mask=response_mask,
+                        observation_mask=data.get('observation_mask', None))
+                    # gate='wins': only clone trajectories with positive GRPO advantage
+                    # (better than group mean) — avoids BC'ing losing behavior, which
+                    # otherwise anchors the policy to base and slows early learning.
+                    _row_mask = None
+                    if str(self.config.get('traj_lm_gate', 'all')).lower() == 'wins':
+                        _adv_pt = (advantages * response_mask).sum(-1) / response_mask.sum(-1).clamp(min=1.0)
+                        _row_mask = (_adv_pt > 0).to(log_prob.dtype)
+                        metrics['actor/traj_lm_frac_wins'] = _row_mask.mean().detach().item()
+                    traj_lm_loss = compute_traj_lm_loss(log_prob, response_mask, _obs_mask, row_mask=_row_mask)
+                    policy_loss = policy_loss + traj_lm_coef * traj_lm_loss
+                    metrics['actor/traj_lm_loss'] = traj_lm_loss.detach().item()
+                    metrics['actor/traj_lm_coef'] = traj_lm_coef
 
                 if self.config.use_dynamic_bsz:
                     # relative to the dynamic bsz
@@ -619,7 +649,12 @@ class DataParallelPPOActor(BasePPOActor):
 
         coef = data.meta_info.get('plan_forecast_coef',
                                   float(self.config.get('plan_forecast_coef', 0.0)))
+        # metric namespace: 'plan_forecast' (default) or 'sft_ablation' when the
+        # RFT-style control reuses this same optimizer path (mutually exclusive).
+        mp = data.meta_info.get('sft_metric_prefix', 'plan_forecast')
         select_keys = ['input_ids', 'attention_mask', 'position_ids', 'loss_mask']
+        if 'loss_weight' in data.batch.keys():   # per-sample group-norm weight
+            select_keys.append('loss_weight')
         batch = data.select(batch_keys=select_keys).batch
 
         mini_batch_size = self.config.get('world_model_mini_batch_size',
@@ -654,17 +689,21 @@ class DataParallelPPOActor(BasePPOActor):
                         loss_mask=loss_mask,
                     )
 
-                loss = coef * pf_loss / gradient_accumulation
+                # per-sample group-norm weight (mean 1; identity when absent)
+                lw = micro['loss_weight'] if 'loss_weight' in micro.keys() else None
+                w = lw.to(pf_loss.dtype).mean() if lw is not None else 1.0
+                loss = coef * w * pf_loss / gradient_accumulation
                 loss.backward()
 
                 append_to_dict(metrics, {
-                    'plan_forecast/sft_loss': pf_loss.detach().item(),
-                    'plan_forecast/coef': coef,
-                    'plan_forecast/valid_tokens': loss_mask.sum().detach().item(),
+                    f'{mp}/sft_loss': pf_loss.detach().item(),
+                    f'{mp}/coef': coef,
+                    f'{mp}/loss_weight_mean': (float(w.item()) if lw is not None else 1.0),
+                    f'{mp}/valid_tokens': loss_mask.sum().detach().item(),
                 })
 
             grad_norm = self._optimizer_step()
-            append_to_dict(metrics, {'plan_forecast/grad_norm': grad_norm.detach().item()})
+            append_to_dict(metrics, {f'{mp}/grad_norm': grad_norm.detach().item()})
 
         self.actor_optimizer.zero_grad()
         return metrics

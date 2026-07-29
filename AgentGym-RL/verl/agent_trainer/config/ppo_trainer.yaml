@@ -91,6 +91,10 @@ actor_rollout_ref:
     ignore_eos: False
     enforce_eager: True
     free_cache_engine: True
+    # WM-SFT observation-target filtering (webshop only). When True, product
+    # fields on search-result pages are excluded from the world-model SFT target
+    # (policy input tokens are unchanged). Default False = current behaviour.
+    wm_obs_filter: False
     load_format: dummy_dtensor
     tensor_model_parallel_size: 2
     max_num_batched_tokens: 8192

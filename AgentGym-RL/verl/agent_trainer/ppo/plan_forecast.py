@@ -246,7 +246,32 @@ def achieved_subgoals(messages) -> List[Tuple[str, int]]:
     return out
 
 
-def build_plan_targets(messages, k: int = 3) -> List[Dict[str, object]]:
+# Per-env substrings (lowercased) marking an action that had NO valid effect —
+# either the client's parse/illegal guard ("Invalid Action.", common to all three
+# envs) or the engine's no-op signal. Used by skip_invalid to drop ineffective
+# actions from the forecast target. Unknown envs fall back to the common set.
+_INVALID_COMMON = ("invalid action",)
+INVALID_OUTCOME_PATTERNS = {
+    "alfworld": ("invalid action", "nothing happens"),
+    "sciworld": ("invalid action", "no known action matches that input"),
+    "webshop": ("invalid action",),
+    "babyai": ("invalid action",),
+}
+
+
+def is_invalid_outcome(result_obs: str, env: str = "alfworld") -> bool:
+    """True if the env feedback ``result_obs`` indicates the action was invalid /
+    had no effect (illegal action, 'Nothing happens.', 'No known action...'). Per-env
+    patterns; unknown env uses the common set."""
+    low = (result_obs or "").lower()
+    for p in INVALID_OUTCOME_PATTERNS.get((env or "").lower(), _INVALID_COMMON):
+        if p in low:
+            return True
+    return False
+
+
+def build_plan_targets(messages, k: int = 3, skip_invalid: bool = False,
+                       env: str = "alfworld") -> List[Dict[str, object]]:
     """For each action turn t, return per-step targets.
 
     {'prefix_end': idx, 'actions': [a_t..a_{t+K-1}], 'subgoals': [..]}
@@ -257,15 +282,36 @@ def build_plan_targets(messages, k: int = 3) -> List[Dict[str, object]]:
     ``subgoals`` are the next-K hindsight-confirmed achieved sub-goals (TODO items
     that got marked (done) at or after this step). Steps with no future action are
     skipped.
+
+    ``skip_invalid`` (default off): drop actions whose RESULT observation signals an
+    invalid / no-effect outcome (per-env, see is_invalid_outcome) — the forecast
+    target then contains only the next-K *effective* actions (looking past the
+    skipped ones). ``env`` selects the invalid-outcome patterns. Only affects the
+    'actions' target; 'subgoals' (hindsight-achieved) is untouched.
     """
     convo = _to_chat_list(messages)
     action_idxs = _action_turn_indices(convo)
     actions_seq = [extract_action(convo[ai]['content']) for ai in action_idxs]
     ach = achieved_subgoals(messages)   # [(text, step_idx)] hindsight-confirmed milestones
 
+    if skip_invalid:
+        # per action turn, the RESULT obs = the next user message after it
+        valid_seq = []
+        for ai in action_idxs:
+            res = (convo[ai + 1]['content'] if (ai + 1 < len(convo)
+                   and convo[ai + 1].get('role') == 'user') else '')
+            valid_seq.append(not is_invalid_outcome(res, env))
+    else:
+        valid_seq = [True] * len(action_idxs)
+
     out: List[Dict[str, object]] = []
     for n, ai in enumerate(action_idxs):
-        fut = [a for a in actions_seq[n:n + k] if a]
+        if skip_invalid:
+            # look past invalid actions: next-K *effective* actions from step n on
+            fut = [actions_seq[j] for j in range(n, len(actions_seq))
+                   if actions_seq[j] and valid_seq[j]][:k]
+        else:
+            fut = [a for a in actions_seq[n:n + k] if a]
         if not fut:
             continue
         # next-K sub-goals that actually complete at or after this step (hindsight)
@@ -288,6 +334,11 @@ def build_plan_forecast_samples(
     seq: str = "separate",
     max_length: int = 4096,
     min_target_tokens: int = 1,
+    k_min: Optional[int] = None,
+    k_max: Optional[int] = None,
+    rng=None,
+    skip_invalid: bool = False,
+    env: str = "alfworld",
 ) -> List[Dict[str, "object"]]:
     """Per-step teacher-forced forecast-SFT samples for one trajectory.
 
@@ -311,76 +362,160 @@ def build_plan_forecast_samples(
                           (Plan block of the realized items + the grounded current
                           action). Use with inline plan ON.
 
+    Horizon: fixed ``k``, or a PER-SAMPLE uniform draw over ``[k_min, k_max]``
+    (curriculum horizon growth — see parse_k_schedule/active_k_range). Default is
+    fixed (``k_min = k_max = k``). Each per-step sample draws its own k_i and the
+    prompt / plan-block are aligned to the REALIZED length after end-of-episode
+    clamping (never over-promises). Pass ``rng`` (e.g. random.Random(global_step))
+    for reproducible draws; falls back to the module RNG otherwise. Each returned
+    sample carries ``k_realized`` (int) for metrics.
+
     Loss mask covers only the target tokens. Returns dicts with torch tensors.
     """
     import torch
-    convo = _to_chat_list(messages)
-    sep_prompt = (DEFAULT_SUBGOAL_PROMPT if target == "subgoal"
-                  else DEFAULT_PLAN_PROMPT).format(k=k)
+    import random as _random
+    if k_min is None or k_max is None:
+        k_min = k_max = int(k)
+    if rng is None:
+        rng = _random
+    prompt_tmpl = (DEFAULT_SUBGOAL_PROMPT if target == "subgoal"
+                   else DEFAULT_PLAN_PROMPT)
 
+    convo = _to_chat_list(messages)
     samples: List[Dict[str, object]] = []
-    for tgt in build_plan_targets(messages, k=k):
-        items = (tgt.get('subgoals') if target == "subgoal"
-                 else tgt.get('actions')) or []
+    for tgt in build_plan_targets(messages, k=k_max, skip_invalid=skip_invalid, env=env):
+        pool = (tgt.get('subgoals') if target == "subgoal"
+                else tgt.get('actions')) or []
+        if not pool:
+            continue
+        k_i = rng.randint(k_min, k_max)      # per-sample horizon
+        items = pool[:k_i]                    # clamp to what's available (<= k_i)
         if not items:
             continue
+        realized = len(items)
         if seq == "inline_consistent":
             # SFT sample == a real rollout turn: obs -> assistant(Plan + Action).
-            # Plan = realized next-K items; Action = the grounded current action.
+            # Plan block lists exactly ``realized`` items (auto-aligned to k_i).
             prefix = list(convo[:tgt['prefix_end'] + 1])
             action = (tgt.get('actions') or [""])[0]
             content = f"{plan_block(items)}\nAction:\n{action}"
             target_msgs = [{'role': 'assistant', 'content': content}]
-        else:  # separate
+        else:  # separate — synthetic prompt formatted with the REALIZED count
             prefix = list(convo[:tgt['prefix_end'] + 1])
-            prefix.append({'role': 'user', 'content': sep_prompt})
+            prefix.append({'role': 'user', 'content': prompt_tmpl.format(k=realized)})
             target_msgs = [{'role': 'assistant', 'content': "\n".join(items)}]
-        try:
-            prefix_text = tokenizer.apply_chat_template(
-                prefix, tokenize=False, add_generation_prompt=True)
-            full_text = tokenizer.apply_chat_template(
-                prefix + target_msgs, tokenize=False, add_generation_prompt=False)
-        except Exception:  # pragma: no cover - tokenizer template missing
-            continue
-
-        prefix_ids = tokenizer(prefix_text, add_special_tokens=False,
-                               return_tensors='pt')['input_ids'][0]
-        full_ids = tokenizer(full_text, add_special_tokens=False,
-                             return_tensors='pt')['input_ids'][0]
-        if full_text.startswith(prefix_text):
-            prefix_len = prefix_ids.size(0)
-        else:
-            common = 0
-            for i in range(min(len(prefix_ids), len(full_ids))):
-                if prefix_ids[i].item() != full_ids[i].item():
-                    break
-                common = i + 1
-            prefix_len = common
-
-        target_len = full_ids.size(0) - prefix_len
-        if target_len < min_target_tokens:
-            continue
-
-        input_ids = full_ids
-        attention_mask = torch.ones_like(input_ids)
-        loss_mask = torch.zeros_like(input_ids)
-        loss_mask[prefix_len:] = 1
-
-        if input_ids.size(0) > max_length:
-            drop = input_ids.size(0) - max_length
-            input_ids = input_ids[drop:]
-            attention_mask = attention_mask[drop:]
-            loss_mask = loss_mask[drop:]
-            if loss_mask.sum().item() < min_target_tokens:
-                continue
-
-        samples.append({
-            'input_ids': input_ids,
-            'attention_mask': attention_mask,
-            'loss_mask': loss_mask,
-        })
+        s = encode_sft_sample(tokenizer, prefix, target_msgs,
+                              max_length=max_length, min_target_tokens=min_target_tokens)
+        if s is not None:
+            s['k_realized'] = realized
+            samples.append(s)
 
     return samples
+
+
+def encode_sft_sample(tokenizer, prefix, target_msgs, max_length: int = 4096,
+                      min_target_tokens: int = 1):
+    """Tokenize a (prefix, target) chat pair into an SFT sample dict whose
+    ``loss_mask`` covers ONLY the target (assistant) tokens — obs/prompt in the
+    prefix contribute zero loss. Shared by plan-forecast and the sft-ablation
+    control so both use byte-identical encoding (clean apples-to-apples). Returns
+    None if templating fails or the target is shorter than ``min_target_tokens``."""
+    import torch
+    try:
+        prefix_text = tokenizer.apply_chat_template(
+            prefix, tokenize=False, add_generation_prompt=True)
+        full_text = tokenizer.apply_chat_template(
+            prefix + target_msgs, tokenize=False, add_generation_prompt=False)
+    except Exception:  # pragma: no cover - tokenizer template missing
+        return None
+
+    prefix_ids = tokenizer(prefix_text, add_special_tokens=False,
+                           return_tensors='pt')['input_ids'][0]
+    full_ids = tokenizer(full_text, add_special_tokens=False,
+                         return_tensors='pt')['input_ids'][0]
+    if full_text.startswith(prefix_text):
+        prefix_len = prefix_ids.size(0)
+    else:
+        common = 0
+        for i in range(min(len(prefix_ids), len(full_ids))):
+            if prefix_ids[i].item() != full_ids[i].item():
+                break
+            common = i + 1
+        prefix_len = common
+
+    target_len = full_ids.size(0) - prefix_len
+    if target_len < min_target_tokens:
+        return None
+
+    input_ids = full_ids
+    attention_mask = torch.ones_like(input_ids)
+    loss_mask = torch.zeros_like(input_ids)
+    loss_mask[prefix_len:] = 1
+
+    if input_ids.size(0) > max_length:
+        drop = input_ids.size(0) - max_length
+        input_ids = input_ids[drop:]
+        attention_mask = attention_mask[drop:]
+        loss_mask = loss_mask[drop:]
+        if loss_mask.sum().item() < min_target_tokens:
+            return None
+
+    return {
+        'input_ids': input_ids,
+        'attention_mask': attention_mask,
+        'loss_mask': loss_mask,
+    }
+
+
+def parse_k_schedule(spec: str):
+    """Parse a horizon-growth schedule string into sorted stages.
+
+    Format: ``"startStep:kMin:kMax,startStep:kMin:kMax,..."`` (start-step
+    semantics: a stage is active for global_step >= startStep and < the next
+    stage's startStep; the last stage persists to the end). Returns a sorted list
+    of ``(start_step, k_min, k_max)`` tuples, or ``[]`` for empty/None (feature
+    off). Raises ValueError on any malformed input so callers can fail fast at init.
+    """
+    s = (spec or "").strip()
+    if not s:
+        return []
+    stages = []
+    for part in s.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        fields = part.split(":")
+        if len(fields) != 3:
+            raise ValueError(f"plan_forecast_k_schedule stage '{part}' must be "
+                             f"'startStep:kMin:kMax'")
+        try:
+            st, lo, hi = int(fields[0]), int(fields[1]), int(fields[2])
+        except ValueError:
+            raise ValueError(f"plan_forecast_k_schedule stage '{part}' has non-integer fields")
+        if st < 0:
+            raise ValueError(f"plan_forecast_k_schedule start step must be >= 0 (got {st})")
+        if lo < 1 or hi < lo:
+            raise ValueError(f"plan_forecast_k_schedule stage '{part}' needs 1 <= kMin <= kMax")
+        stages.append((st, lo, hi))
+    stages.sort(key=lambda x: x[0])
+    if stages[0][0] != 0:
+        raise ValueError("plan_forecast_k_schedule: first stage must start at step 0")
+    for a, b in zip(stages, stages[1:]):
+        if b[0] <= a[0]:
+            raise ValueError("plan_forecast_k_schedule: start steps must be strictly increasing")
+    return stages
+
+
+def active_k_range(stages, global_step: int):
+    """Given parsed stages and the current global_step, return the active
+    ``(k_min, k_max)`` — the last stage whose start_step <= global_step."""
+    cur = stages[0]
+    for st in stages:
+        if st[0] <= global_step:
+            cur = st
+        else:
+            break
+    return cur[1], cur[2]
 
 
 def build_plan_forecast_batch(
@@ -394,15 +529,64 @@ def build_plan_forecast_batch(
     seq: str = "separate",
     max_length: int = 4096,
     max_samples_per_trajectory: Optional[int] = None,
+    k_min: Optional[int] = None,
+    k_max: Optional[int] = None,
+    rng=None,
+    skip_invalid: bool = False,
+    env: str = "alfworld",
+    group_ids=None,
+    group_gate: str = "off",
+    group_low: float = 0.5,
+    group_high: float = 1.0,
+    group_norm: bool = False,
+    group_dedup: bool = True,
 ):
     """Padded forecast-SFT batch over trajectories, with win/all gating.
 
     gate='wins' keeps only trajectories whose reward > success_threshold (needs
     ``rewards`` aligned to ``messages_list``); gate='all' keeps everything.
     target ∈ {action, subgoal}; seq ∈ {separate, inline_consistent} — see
-    build_plan_forecast_samples. Reuses collate_world_model_samples for padding.
+    build_plan_forecast_samples. Horizon is a fixed ``k`` unless ``k_min``/``k_max``
+    are given (per-sample draw over the active stage; pass ``rng`` for reproducible
+    draws). Reuses collate_world_model_samples for padding.
+
+    Two ORTHOGONAL group knobs (both need ``group_ids`` = the GRPO ``uid`` aligned to
+    messages_list; both distill successful trajectories only). They compose: gating
+    selects WHICH groups' successes to distill, then group_norm reweights those.
+
+    - Group-success GATING (``group_gate``): 'off' (use plain ``gate``), 'low'
+      (group success-rate <= group_low), 'low_high' (rate <= group_low OR >= group_high;
+      skip the mid-rate groups where GRPO's own signal is strong). A curriculum focus.
+    - Group-weight NORMALIZATION (``group_norm``): give every kept GROUP the SAME total
+      plan-CE weight (=1 after renorm), so each group's contribution stays constant as
+      success-rate rises -> no SFT blow-up. ``group_dedup`` (default True) splits that
+      weight over the group's DISTINCT successful action-sequences (each unique seq ->
+      1/u_g, further shared among its duplicate copies), so duplicate rollouts don't
+      inflate weight -- this matters mid/late training where within-group action
+      trajectories become highly repetitive. ``group_dedup=False`` = legacy: split
+      evenly per trajectory (1/m_g). Emits per-sample ``loss_weight`` (mean 1; the actor
+      applies it scaled by plan_forecast_coef).
     """
     from verl.agent_trainer.ppo.world_model_loss import collate_world_model_samples
+
+    # Per-group success rate (for group_gate).
+    group_gate = (group_gate or "off").lower()
+    g_rate = {}
+    if group_gate != "off" and group_ids is not None and rewards is not None:
+        from collections import defaultdict
+        _acc = defaultdict(list)
+        for gid, r in zip(group_ids, rewards):
+            _acc[gid].append(1.0 if (r is not None and float(r) > success_threshold) else 0.0)
+        g_rate = {gid: (sum(v) / len(v) if v else 0.0) for gid, v in _acc.items()}
+
+    def _group_ok(i):
+        gid = group_ids[i] if (group_ids is not None and i < len(group_ids)) else None
+        rate = g_rate.get(gid, 0.0)
+        if group_gate == "low":
+            return rate <= group_low
+        if group_gate == "low_high":
+            return rate <= group_low or rate >= group_high
+        return True
 
     all_samples: List[Dict[str, object]] = []
     n_traj_used = 0
@@ -410,12 +594,22 @@ def build_plan_forecast_batch(
     n_traj_considered = 0
     n_achieved_total = 0
     n_traj_with_done = 0
+    traj_records = []   # (group_id, n_samples, start_idx) per distilled traj (group_norm)
     for i, messages in enumerate(messages_list):
         if messages is None:
             continue
-        if gate == "wins":
-            r = rewards[i] if (rewards is not None and i < len(rewards)) else 0.0
-            if not (r is not None and float(r) > success_threshold):
+        r = rewards[i] if (rewards is not None and i < len(rewards)) else 0.0
+        succ = (r is not None and float(r) > success_threshold)
+        # keep decision (gating and norm both distill successes only; gating also
+        # filters by group success-rate). group_norm then reweights the kept ones.
+        if group_gate != "off":
+            if not succ or not _group_ok(i):
+                continue
+        elif group_norm:
+            if not succ:
+                continue
+        elif gate == "wins":
+            if not succ:
                 continue
         n_traj_considered += 1
         if target == "subgoal":
@@ -424,12 +618,56 @@ def build_plan_forecast_batch(
             n_traj_with_done += 1 if ach else 0
         traj_samples = build_plan_forecast_samples(
             messages=messages, tokenizer=tokenizer, k=k,
-            target=target, seq=seq, max_length=max_length)
+            target=target, seq=seq, max_length=max_length,
+            k_min=k_min, k_max=k_max, rng=rng,
+            skip_invalid=skip_invalid, env=env)
         if max_samples_per_trajectory is not None and len(traj_samples) > max_samples_per_trajectory:
             traj_samples = traj_samples[-max_samples_per_trajectory:]
         if traj_samples:
             n_traj_used += 1
+        _start = len(all_samples)
         all_samples.extend(traj_samples)
+        if group_norm and traj_samples:
+            gid = group_ids[i] if (group_ids is not None and i < len(group_ids)) else i
+            # dedup key = the trajectory's realized action sequence (full, original)
+            _cv = _to_chat_list(messages)
+            seq_key = tuple(extract_action(_cv[a].get("content", "")) for a in _action_turn_indices(_cv))
+            traj_records.append((gid, len(traj_samples), _start, seq_key))
+
+    # Group-weight normalization: each GROUP contributes equally (total weight 1 after
+    # renorm, so every prompt is equal-weight regardless of how many successes it has).
+    # group_dedup=True (default): split the group's weight over its DISTINCT successful
+    # action-sequences -- each unique seq gets 1/u_g, further split among its duplicate
+    # copies (per-copy = 1/(u_g * #copies)). So duplicate rollouts do NOT inflate weight;
+    # every distinct successful strategy is equal-weight. group_dedup=False = legacy:
+    # split evenly per trajectory (1/m_g). Renormalized to mean 1 so loss scale is fixed.
+    if group_norm and traj_records:
+        from collections import Counter, defaultdict
+        wts = [1.0] * len(all_samples)
+        if group_dedup:
+            by_g = defaultdict(list)
+            for idx, (gid, _cnt, _start, seq) in enumerate(traj_records):
+                by_g[gid].append((seq, idx))
+            rec_w = [0.0] * len(traj_records)
+            for gid, items in by_g.items():
+                seqc = Counter(s for s, _ in items)
+                u_g = len(seqc)                                  # distinct seqs in group
+                for seq, idx in items:
+                    rec_w[idx] = 1.0 / (u_g * seqc[seq])         # unique seq equal-weighted
+            for idx, (gid, cnt, start, seq) in enumerate(traj_records):
+                for j in range(start, start + cnt):
+                    wts[j] = rec_w[idx]
+        else:
+            m_g = Counter(gid for gid, _, _, _ in traj_records)  # group -> #distilled trajs
+            for gid, cnt, start, seq in traj_records:
+                wt = 1.0 / max(1, m_g[gid])
+                for j in range(start, start + cnt):
+                    wts[j] = wt
+        _mw = (sum(wts) / len(wts)) if wts else 1.0
+        if _mw > 0:
+            wts = [w / _mw for w in wts]
+        for s, w in zip(all_samples, wts):
+            s['loss_weight'] = w
 
     batch = collate_world_model_samples(
         samples=all_samples,
@@ -437,13 +675,48 @@ def build_plan_forecast_batch(
         max_length=max_length,
     )
     _cons = max(1, n_traj_considered)
+    # realized-horizon metrics (k_mean = mean realized target length after clamping)
+    _eff_min = k_min if k_min is not None else k
+    _eff_max = k_max if k_max is not None else k
+    _ks = [int(s.get('k_realized', 0)) for s in all_samples]
+    k_mean = (sum(_ks) / len(_ks)) if _ks else float(_eff_min)
     meta = {"plan_forecast/n_samples": float(len(all_samples)),
             "plan_forecast/n_traj_used": float(n_traj_used),
             "plan_forecast/n_traj_considered": float(n_traj_considered),
             "plan_forecast/gate_wins": 1.0 if gate == "wins" else 0.0,
             "plan_forecast/seq_inline_consistent": 1.0 if seq == "inline_consistent" else 0.0,
             "plan_forecast/target_subgoal": 1.0 if target == "subgoal" else 0.0,
-            "plan_forecast/k": float(k)}
+            "plan_forecast/k_min": float(_eff_min),
+            "plan_forecast/k_max": float(_eff_max),
+            "plan_forecast/k_mean": float(k_mean),
+            "plan_forecast/skip_invalid": 1.0 if skip_invalid else 0.0,
+            "plan_forecast/group_gate": {"off": 0.0, "low": 1.0, "low_high": 2.0}.get(group_gate, 0.0),
+            "plan_forecast/group_norm": 1.0 if group_norm else 0.0,
+            "plan_forecast/k": float(k_mean)}
+    if group_gate != "off" and g_rate:
+        _kept = sum(1 for gid, rt in g_rate.items()
+                    if (rt <= group_low or (group_gate == "low_high" and rt >= group_high)))
+        meta.update({
+            "plan_forecast/group_low_thresh": float(group_low),
+            "plan_forecast/group_high_thresh": float(group_high),
+            "plan_forecast/group_n_total": float(len(g_rate)),
+            "plan_forecast/group_n_kept": float(_kept),
+            "plan_forecast/group_succ_rate_mean": float(sum(g_rate.values()) / len(g_rate)),
+        })
+    if group_norm and traj_records:
+        from collections import Counter as _Counter, defaultdict as _dd
+        _mg = _Counter(gid for gid, _, _, _ in traj_records)
+        _byg = _dd(list)
+        for gid, _c, _s, seq in traj_records:
+            _byg[gid].append(seq)
+        # per-group distinct-fraction: unique seqs / trajectories (1.0 = no dup in group)
+        _ratios = [len(set(v)) / len(v) for v in _byg.values() if v]
+        meta.update({
+            "plan_forecast/group_n_distilled": float(len(_mg)),
+            "plan_forecast/group_succ_traj_per_group_mean": float(sum(_mg.values()) / len(_mg)),
+            "plan_forecast/group_dedup": 1.0 if group_dedup else 0.0,
+            "plan_forecast/group_unique_frac": float(sum(_ratios) / len(_ratios)) if _ratios else 1.0,
+        })
     if target == "subgoal":
         # done-marking health: is the LLM actually checking sub-goals off?
         meta.update({

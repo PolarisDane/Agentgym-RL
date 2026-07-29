@@ -7,7 +7,7 @@ TRAIN_CODE_DIR="${ROOT}/AgentGym-RL"
 CONDA_SH="${CONDA_SH:-/opt/conda/etc/profile.d/conda.sh}"
 TRAIN_ENV="${TRAIN_ENV:-/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/cy/conda_envs/agentgym-rl}"
 MODEL_PATH="${MODEL_PATH:-/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/ziyu/.cache/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28}"
-TASK_NAME="webshop"
+TASK_NAME="sciworld"
 
 export HF_HUB_OFFLINE=1
 export WANDB_MODE=offline
@@ -18,17 +18,9 @@ CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 IFS=',' read -r -a GPU_ARRAY <<< "${CUDA_VISIBLE_DEVICES}"
 NUM_GPUS="${#GPU_ARRAY[@]}"
 
-# Number of env-server processes per GPU. Each rank round-robins over its own shard
-# of servers (verl/utils/agentgym/client.py::_select_env_addr), so >1 lets one GPU's
-# concurrent env clients spread across processes/cores instead of being GIL-serialised
-# in a single server process. Total servers started = ENVS_PER_GPU * NUM_GPUS.
-ENVS_PER_GPU="${ENVS_PER_GPU:-4}"
-NUM_ENV_SERVERS=$((NUM_GPUS * ENVS_PER_GPU))
-
-# Automatically construct comma-separated list of environment addresses.
-# Order matters: rank r owns addrs[r*ENVS_PER_GPU : (r+1)*ENVS_PER_GPU].
+# Automatically construct comma-separated list of environment addresses
 ENV_ADDR_LIST=""
-for i in $(seq 0 $((NUM_ENV_SERVERS - 1))); do
+for i in $(seq 0 $((NUM_GPUS - 1))); do
   PORT=$((BASE_PORT + i))
   ADDR="http://${ENV_ADDR_HOST}:${PORT}"
   if [[ -z "${ENV_ADDR_LIST}" ]]; then
@@ -41,7 +33,7 @@ ENV_ADDR="${ENV_ADDR:-${ENV_ADDR_LIST}}"
 echo "Using ENV_ADDR: ${ENV_ADDR}"
 
 WANDB_MODE="${WANDB_MODE:-offline}"
-PROJECT_NAME="${PROJECT_NAME:-agentgym-webshop}"
+PROJECT_NAME="${PROJECT_NAME:-agentgym-sciworld}"
 
 KL_COEF="${KL_COEF:-0.001}"
 ENTROPY_COEF="${ENTROPY_COEF:-0.001}"
@@ -51,14 +43,14 @@ TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-16}"
 PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-8}"
 PPO_MICRO_BATCH_SIZE_PER_GPU="${PPO_MICRO_BATCH_SIZE_PER_GPU:-1}"
 PPO_EPOCHS="${PPO_EPOCHS:-1}"
-TOTAL_EPOCHS="${TOTAL_EPOCHS:-5}"
-MAX_ROUNDS="${MAX_ROUNDS:-15}"
+TOTAL_EPOCHS="${TOTAL_EPOCHS:-2}"
+MAX_ROUNDS="${MAX_ROUNDS:-20}"
 MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-2048}"
-MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-8192}"
-MAX_MODEL_LEN="${MAX_MODEL_LEN:-16384}"
+MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-4096}"
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-8192}"
 MAX_TOKENS_PER_TURN="${MAX_TOKENS_PER_TURN:-512}"
 ROLLOUT_GPU_MEMORY_UTILIZATION="${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.80}"
-SAVE_FREQ="${SAVE_FREQ:-25}"
+SAVE_FREQ="${SAVE_FREQ:-50}"
 
 ENABLE_ERC="${ENABLE_ERC:-0}"
 ERC_MU_BASE="${ERC_MU_BASE:-1.0}"
@@ -66,6 +58,12 @@ ERC_MU_EXP="${ERC_MU_EXP:-1.5}"
 ERC_ETA_WM="${ERC_ETA_WM:-2.0}"
 ERC_LAMBDA_WM="${ERC_LAMBDA_WM:-1.0}"
 ERC_CLIPPING_TYPE="${ERC_CLIPPING_TYPE:-global}"
+# Default: epi_intrinsic_add (Design A) — pure non-negative additive intrinsic
+# bonus on advantage:  A_t += EPI_INTRINSIC_COEF * min(U_t, EPI_INTRINSIC_CAP),
+# with U_t = max(0, NLL_t - H_t). Calibration-gap ICM variant (noisy-TV-robust)
+# applied at the advantage layer, parallel to and reinforcing WM-SFT
+# (WM-SFT is active whenever WMC_COEFF > 0; default 0.01).
+# Other methods: 'add' / 'epistemic_scale' / 'mask' / 'sigmoid' / etc.
 ERC_CLIPPING_METHOD="${ERC_CLIPPING_METHOD:-add}"
 ERC_MOMENTUM="${ERC_MOMENTUM:-0.8}"
 # Uncertainty-scaling (set ERC_CLIPPING_METHOD=uncertainty_scale to use):
@@ -94,9 +92,9 @@ SAFE_COMMIT_CLF_MAX_NEW="${SAFE_COMMIT_CLF_MAX_NEW:-24}"
 SAFE_COMMIT_GMAX="${SAFE_COMMIT_GMAX:-2.0}"
 SAFE_COMMIT_GMIN="${SAFE_COMMIT_GMIN:-0.5}"
 SAFE_COMMIT_RENORMALIZE="${SAFE_COMMIT_RENORMALIZE:-True}"
-WMLOSS_ADD_COEF="${WMLOSS_ADD_COEF:-0.2}"
-WMLOSS_ADD_COEF_END="${WMLOSS_ADD_COEF_END:-0}"
-WMLOSS_ADD_HORIZON="${WMLOSS_ADD_HORIZON:-0}"
+WMLOSS_ADD_COEF="${WMLOSS_ADD_COEF:-0.3}"
+WMLOSS_ADD_COEF_END="${WMLOSS_ADD_COEF_END:-0.1}"
+WMLOSS_ADD_HORIZON="${WMLOSS_ADD_HORIZON:-100}"
 WMLOSS_ADD_USE_ENTROPY="${WMLOSS_ADD_USE_ENTROPY:-True}"
 WMLOSS_ADD_USE_EMA="${WMLOSS_ADD_USE_EMA:-False}"
 WMLOSS_ADD_USE_GROUPED="${WMLOSS_ADD_USE_GROUPED:-False}"
@@ -110,16 +108,16 @@ REF_NLL_COEF="${REF_NLL_COEF:-0.1}"
 # Epistemic advantage scaling (set ERC_CLIPPING_METHOD=epistemic_scale to use).
 EPISTEMIC_USE_REF="${EPISTEMIC_USE_REF:-False}"
 EPISTEMIC_BASE="${EPISTEMIC_BASE:-1.0}"
-EPISTEMIC_S_MAX="${EPISTEMIC_S_MAX:-3.0}"
-EPISTEMIC_SHAPE="${EPISTEMIC_SHAPE:-sqrt}"
-EPISTEMIC_BASE_NEG="${EPISTEMIC_BASE_NEG:-${EPISTEMIC_BASE}}"
+EPISTEMIC_S_MAX="${EPISTEMIC_S_MAX:-5.0}"
+EPISTEMIC_SHAPE="${EPISTEMIC_SHAPE:-linear}"
+EPISTEMIC_BASE_NEG="${EPISTEMIC_BASE_NEG:-5.0}"
 EPISTEMIC_PRE_ADD_COEF="${EPISTEMIC_PRE_ADD_COEF:-0.0}"
 # Design A: pure non-negative additive intrinsic bonus on advantage.
 #   A_t += EPI_INTRINSIC_COEF * min(U_t, EPI_INTRINSIC_CAP), U=max(0, NLL-H).
 # Use with ERC_CLIPPING_METHOD=epi_intrinsic_add. No recentering, no per-turn
 # redistribution -- just a calibration-gap intrinsic reward at the advantage
 # layer (noisy-TV-robust ICM variant), parallel to WM-SFT.
-EPI_INTRINSIC_COEF="${EPI_INTRINSIC_COEF:-0.3}"
+EPI_INTRINSIC_COEF="${EPI_INTRINSIC_COEF:-0.2}"
 EPI_INTRINSIC_CAP="${EPI_INTRINSIC_CAP:-0.5}"
 EPI_INTRINSIC_USE_REF="${EPI_INTRINSIC_USE_REF:-False}"
 EPISTEMIC_INVERT_ON_NEG="${EPISTEMIC_INVERT_ON_NEG:-False}"
@@ -157,13 +155,12 @@ HCA_HISTORY_LEN="${HCA_HISTORY_LEN:-0}"   # 0 = FULL history (consistent with ou
 # Progress/Exploration credit (DEFAULT OFF): classify P/E steps per traj, add all-positive
 # advantage (omega_p on progress > omega_e on exploration; P/E overlap -> P; wins only).
 PE_CREDIT_ENABLE="${PE_CREDIT_ENABLE:-False}"
-PE_OMEGA_PROGRESS="${PE_OMEGA_PROGRESS:-1.0}"
-PE_OMEGA_EXPLORE="${PE_OMEGA_EXPLORE:-0.4}"
+PE_OMEGA_PROGRESS="${PE_OMEGA_PROGRESS:-0.5}"
+PE_OMEGA_EXPLORE="${PE_OMEGA_EXPLORE:-0.2}"
 PE_CREDIT_WINS_ONLY="${PE_CREDIT_WINS_ONLY:-True}"
-PE_CLF_ENV="${PE_CLF_ENV:-webshop}"
+PE_CLF_ENV="${PE_CLF_ENV:-alfworld}"
 # Plan-forecast auxiliary SFT (DEFAULT OFF): each step predict the realized next-K
 # action commands (current included). Separate forward, CE loss * coef, no PG.
-# gate=wins -> only winning trajectories; gate=all -> every trajectory.
 PLAN_FORECAST_ENABLE="${PLAN_FORECAST_ENABLE:-True}"
 PLAN_FORECAST_COEF="${PLAN_FORECAST_COEF:-0.01}"
 PLAN_FORECAST_K="${PLAN_FORECAST_K:-3}"
@@ -184,7 +181,7 @@ PLAN_FORECAST_GROUP_NORM="${PLAN_FORECAST_GROUP_NORM:-True}"
 # group_dedup (default True): when group_norm on, split each group's weight over its
 # DISTINCT successful action-sequences instead of per-trajectory -> duplicate rollouts
 # don't inflate weight (within-group action repetition is heavy mid/late training).
-PLAN_FORECAST_GROUP_DEDUP="${PLAN_FORECAST_GROUP_DEDUP:-True}"
+PLAN_FORECAST_GROUP_DEDUP="${PLAN_FORECAST_GROUP_DEDUP:-False}"
 # Horizon-growth schedule (curriculum): grow the forecast target length over
 # training. Format "startStep:kMin:kMax,..." (start-step semantics, last stage
 # persists); each per-step sample draws k uniformly in the active [kMin,kMax] and
@@ -205,9 +202,9 @@ PLAN_FORECAST_TARGET="${PLAN_FORECAST_TARGET:-action}"
 # obs->Plan+Action; use with inline ON). Auto-falls-back to separate if inline off.
 PLAN_FORECAST_SEQ="${PLAN_FORECAST_SEQ:-separate}"
 # plan_forecast_coef anneal: fixed | linear | power | cutoff (start = PLAN_FORECAST_COEF).
-PLAN_FORECAST_COEF_ANNEAL="${PLAN_FORECAST_COEF_ANNEAL:-linear}"
+PLAN_FORECAST_COEF_ANNEAL="${PLAN_FORECAST_COEF_ANNEAL:-fixed}"
 PLAN_FORECAST_COEF_END="${PLAN_FORECAST_COEF_END:-0.0}"
-PLAN_FORECAST_COEF_HORIZON="${PLAN_FORECAST_COEF_HORIZON:-25}"
+PLAN_FORECAST_COEF_HORIZON="${PLAN_FORECAST_COEF_HORIZON:-50}"
 PLAN_FORECAST_COEF_POWER="${PLAN_FORECAST_COEF_POWER:-2.0}"
 PLAN_FORECAST_COEF_CUTOFF_STEP="${PLAN_FORECAST_COEF_CUTOFF_STEP:-0}"
 # Plan FORMAT reward (DEFAULT OFF): per-turn shaping bonus on advantage for a
@@ -229,10 +226,10 @@ PLAN_INLINE_K="${PLAN_INLINE_K:-${PLAN_FORECAST_K}}"
 # list with (done) marks; pair with PLAN_FORECAST_TARGET=subgoal).
 PLAN_INLINE_STYLE="${PLAN_INLINE_STYLE:-actions}"
 # per-turn reminder: re-state the Plan request after EVERY obs (one-time decays).
-PLAN_INLINE_PER_TURN="${PLAN_INLINE_PER_TURN:-False}"   # ARCHIVED: per-turn reminder off; opening prompt only
+PLAN_INLINE_PER_TURN="${PLAN_INLINE_PER_TURN:-False}"
 # inline warmup: use ORIGINAL prompt until global_step >= this, then introduce
 # the plan prompt (cold-start: let task competence build before planning).
-PLAN_INLINE_WARMUP_STEPS="${PLAN_INLINE_WARMUP_STEPS:-10}"
+PLAN_INLINE_WARMUP_STEPS="${PLAN_INLINE_WARMUP_STEPS:-0}"
 # think reminder (alternative to inline plan, mutually exclusive): per-turn nudge
 # to reason in a Thought before the Action, WITHOUT forcing a Plan.
 THINK_REMINDER_ENABLE="${THINK_REMINDER_ENABLE:-False}"
@@ -240,10 +237,6 @@ THINK_REMINDER_ENABLE="${THINK_REMINDER_ENABLE:-False}"
 # delimiter) instead of the whole Thought+Action turn. Default OFF.
 
 WMC_COEFF="${WMC_COEFF:-0}"
-# WM-SFT observation-target filter (webshop): drop unpredictable product fields
-# (asin/title/price) on search-result pages from the world-model SFT target only.
-# Policy inputs unchanged. Default False. Metrics: wm_obs/filtered_frac, failsafe_hits.
-WM_OBS_FILTER="${WM_OBS_FILTER:-False}"
 WMC_TYPE="${WMC_TYPE:-fixed}"
 WMC_START_COEFF="${WMC_START_COEFF:-0.001}"
 WMC_END_COEFF="${WMC_END_COEFF:-0.0}"
@@ -259,11 +252,18 @@ WM_MAX_LENGTH="${WM_MAX_LENGTH:-4096}"
 WM_MAX_SAMPLES_PER_TRAJECTORY="${WM_MAX_SAMPLES_PER_TRAJECTORY:-null}"
 WM_MIN_ENV_TOKENS="${WM_MIN_ENV_TOKENS:-1}"
 
-EXP_NAME="${EXP_NAME:-webshop_grpo_qwen2.5_3b_$(date -u +%Y%m%d_%H%M%S)}"
+EXP_NAME="${EXP_NAME:-sciworld_grpo_qwen2.5_3b_$(date -u +%Y%m%d_%H%M%S)}"
 CKPT_DIR="${CKPT_DIR:-${ROOT}/checkpoints/${EXP_NAME}}"
 RUN_DIR="${RUN_DIR:-${ROOT}/runlogs/${EXP_NAME}}"
+# Checkpoint resume. 'auto' (default): auto-resume from the latest global_step_* in
+# CKPT_DIR if present, else train from scratch. To actually resume a prior run you
+# MUST reuse its EXP_NAME (CKPT_DIR is derived from it -- the default timestamped
+# EXP_NAME makes a fresh dir every launch and thus never resumes). Set to a specific
+# 'global_step_N' folder (abs or relative to cwd) to resume that exact step, or
+# 'disable' to force from-scratch.
+RESUME_MODE="${RESUME_MODE:-auto}"
 ROLLOUT_LOG_DIR="${ROLLOUT_LOG_DIR:-${RUN_DIR}/rollout_logs}"
-TRAIN_FILE="${TRAIN_FILE:-${ROOT}/AgentItemId/train/webshop_train.json}"
+TRAIN_FILE="${TRAIN_FILE:-${ROOT}/AgentItemId/train/sciworld_train.json}"
 LOG_PATH="${LOG_PATH:-}"
 
 mkdir -p "${CKPT_DIR}" "${RUN_DIR}" "${ROLLOUT_LOG_DIR}"
@@ -323,7 +323,6 @@ exec env \
     actor_rollout_ref.rollout.dtype=bfloat16 \
     actor_rollout_ref.rollout.enforce_eager=True \
     actor_rollout_ref.rollout.free_cache_engine=True \
-    actor_rollout_ref.rollout.wm_obs_filter="${WM_OBS_FILTER}" \
     actor_rollout_ref.rollout.load_format=dummy_dtensor \
     actor_rollout_ref.rollout.enable_chunked_prefill=True \
     actor_rollout_ref.rollout.gpu_memory_utilization="${ROLLOUT_GPU_MEMORY_UTILIZATION}" \
@@ -336,6 +335,7 @@ exec env \
     trainer.project_name="${PROJECT_NAME}" \
     trainer.experiment_name="${EXP_NAME}" \
     trainer.default_local_dir="${CKPT_DIR}" \
+    trainer.resume_mode="${RESUME_MODE}" \
     trainer.save_freq="${SAVE_FREQ}" \
     trainer.total_epochs="${TOTAL_EPOCHS}" \
     trainer.nnodes=1 \

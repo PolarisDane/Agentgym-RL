@@ -17,6 +17,7 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 
 import os
+import random
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -46,6 +47,11 @@ from verl.agent_trainer.ppo.world_model_loss import (
 )
 from verl.agent_trainer.ppo.plan_forecast import (
     build_plan_forecast_batch,
+    parse_k_schedule,
+    active_k_range,
+)
+from verl.agent_trainer.ppo.sft_ablation import (
+    build_sft_ablation_batch,
 )
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
@@ -763,6 +769,26 @@ class RayPPOTrainer(object):
         # config next to the other plan_forecast_* settings.
         self.plan_forecast_coeff_scheduler = self._build_plan_forecast_scheduler()
 
+        # plan_forecast and the sft-ablation (RFT) control are MUTUALLY EXCLUSIVE:
+        # they share one optimizer path and are meant to be A/B'd, never combined.
+        _acfg = self.config.actor_rollout_ref.actor
+        if bool(_acfg.get('plan_forecast_enable', False)) and bool(_acfg.get('sft_ablation_enable', False)):
+            raise ValueError("plan_forecast_enable and sft_ablation_enable are mutually "
+                             "exclusive — enable exactly one.")
+
+        # plan_forecast horizon-growth schedule (empty = off -> fixed plan_forecast_k).
+        # Parsed once here so a malformed spec fails fast at init instead of being
+        # swallowed by the forecast dispatch's try/except at every step.
+        self._pf_k_stages = parse_k_schedule(str(_acfg.get('plan_forecast_k_schedule', '') or ''))
+
+        # traj_lm (full-sequence next-token CE over obs AND response) and WM-SFT
+        # (obs-only CE) are MUTUALLY EXCLUSIVE — traj_lm already covers the obs tokens.
+        if float(_acfg.get('traj_lm_coef', 0.0)) > 0 and (
+                float(_acfg.get('world_model_coeff', 0.0)) > 0
+                or bool((_acfg.get('world_model', None) or {}).get('enable', False))):
+            raise ValueError("traj_lm_coef and WM-SFT (world_model_coeff>0 or "
+                             "world_model.enable) are mutually exclusive — enable at most one.")
+
         OmegaConf.set_struct(self.config, True)
         with open_dict(self.config):
             self.config.actor_rollout_ref.actor.optim.total_training_steps = total_training_steps
@@ -935,29 +961,41 @@ class RayPPOTrainer(object):
     def _build_world_model_sft_dataproto(self, batch: DataProto):
         """Build a DataProto of env-prediction SFT samples from rollout messages.
 
-        Returns ``None`` when the world-model auxiliary pass is disabled, the
-        rollout did not expose ``rollout_messages``, or no env turn qualifies
-        as an SFT target.
+        Only ever called from the enable-gated separate WM-SFT dispatch, so it does
+        NOT re-check the enable/coef switch here (that guard was dead code once the
+        dispatch became enable-gated). Returns ``None`` when the rollout did not
+        expose ``rollout_messages`` or no env turn qualifies as an SFT target.
         """
         wm_cfg = self.config.actor_rollout_ref.actor.get('world_model', None)
         if wm_cfg is None:
-            return None
-        coef = float(self.config.actor_rollout_ref.actor.get('world_model_coeff', 0.0))
-        if coef <= 0 and not wm_cfg.get('enable', False):
             return None
 
         messages_list = batch.non_tensor_batch.get('rollout_messages', None)
         if messages_list is None:
             return None
 
-        assembled = build_world_model_sft_batch(
-            messages_list=list(messages_list),
-            tokenizer=self.tokenizer,
-            env_predict_prompt=wm_cfg.get('env_predict_prompt', None) or DEFAULT_WORLD_MODEL_PROMPT,
-            max_length=int(wm_cfg.get('max_length', 4096)),
-            max_samples_per_trajectory=wm_cfg.get('max_samples_per_trajectory', None),
-            min_env_tokens=int(wm_cfg.get('min_env_tokens', 1)),
-        )
+        # C3 placebo (WM-value experiment): shuffle obs targets — same tokens/loss,
+        # no real dynamics signal. Default off => normal WM-SFT untouched.
+        if bool(wm_cfg.get('placebo_shuffle', False)):
+            from verl.agent_trainer.ppo.world_model_loss import build_world_model_placebo_batch
+            assembled = build_world_model_placebo_batch(
+                messages_list=list(messages_list),
+                tokenizer=self.tokenizer,
+                env_predict_prompt=wm_cfg.get('env_predict_prompt', None) or DEFAULT_WORLD_MODEL_PROMPT,
+                max_length=int(wm_cfg.get('max_length', 4096)),
+                max_samples_per_trajectory=wm_cfg.get('max_samples_per_trajectory', None),
+                min_env_tokens=int(wm_cfg.get('min_env_tokens', 1)),
+                seed=int(self.global_steps),
+            )
+        else:
+            assembled = build_world_model_sft_batch(
+                messages_list=list(messages_list),
+                tokenizer=self.tokenizer,
+                env_predict_prompt=wm_cfg.get('env_predict_prompt', None) or DEFAULT_WORLD_MODEL_PROMPT,
+                max_length=int(wm_cfg.get('max_length', 4096)),
+                max_samples_per_trajectory=wm_cfg.get('max_samples_per_trajectory', None),
+                min_env_tokens=int(wm_cfg.get('min_env_tokens', 1)),
+            )
         if assembled is None:
             return None
         return DataProto.from_single_dict(assembled)
@@ -1020,6 +1058,33 @@ class RayPPOTrainer(object):
             print("[plan_forecast] seq=inline_consistent -> separate (inline plan OFF)", flush=True)
             seq = 'separate'
 
+        # Horizon: fixed plan_forecast_k, or a per-sample draw over the active stage
+        # of the horizon-growth schedule (curriculum). RNG seeded by global_step so
+        # the draw is reproducible and resume-consistent.
+        k_min = k_max = None
+        if self._pf_k_stages:
+            k_min, k_max = active_k_range(self._pf_k_stages, self.global_steps)
+        rng = random.Random(self.global_steps)
+
+        # skip_invalid: drop actions whose env result was invalid/no-effect from the
+        # forecast target (per-env patterns keyed by the task name). Default off.
+        skip_invalid = bool(actor_cfg.get('plan_forecast_skip_invalid', False))
+        try:
+            env_name = str(self.config.actor_rollout_ref.agentgym.get('task_name', 'alfworld'))
+        except Exception:
+            env_name = 'alfworld'
+
+        # group knobs (both need uid aligned to rollout_messages, default off, compose):
+        # group_gate = filter which groups' successes to distill (curriculum);
+        # group_norm = give each kept group equal total plan-CE weight (stability).
+        group_gate = str(actor_cfg.get('plan_forecast_group_gate', 'off')).lower()
+        group_norm = bool(actor_cfg.get('plan_forecast_group_norm', False))
+        group_ids = None
+        if group_gate != 'off' or group_norm:
+            _uid = batch.non_tensor_batch.get('uid', None)
+            if _uid is not None:
+                group_ids = list(_uid)
+
         assembled, meta = build_plan_forecast_batch(
             messages_list=list(messages_list),
             tokenizer=self.tokenizer,
@@ -1031,6 +1096,50 @@ class RayPPOTrainer(object):
             seq=seq,
             max_length=int(actor_cfg.get('plan_forecast_max_length', 4096)),
             max_samples_per_trajectory=actor_cfg.get('plan_forecast_max_samples_per_traj', None),
+            k_min=k_min,
+            k_max=k_max,
+            rng=rng,
+            skip_invalid=skip_invalid,
+            env=env_name,
+            group_ids=group_ids,
+            group_gate=group_gate,
+            group_low=float(actor_cfg.get('plan_forecast_group_low_thresh', 0.5)),
+            group_high=float(actor_cfg.get('plan_forecast_group_high_thresh', 1.0)),
+            group_norm=group_norm,
+            group_dedup=bool(actor_cfg.get('plan_forecast_group_dedup', True)),
+        )
+        if assembled is None:
+            return None, meta
+        return DataProto.from_single_dict(assembled), meta
+
+    def _build_sft_ablation_dataproto(self, batch: DataProto, coef: float):
+        """Build the RFT-style SFT-ablation DataProto (behavior-clone this step's
+        winning trajectories). Control for plan-forecast; mutually exclusive with it.
+        Same win-gating / reward source as ``_build_plan_forecast_dataproto``."""
+        actor_cfg = self.config.actor_rollout_ref.actor
+        if not actor_cfg.get('sft_ablation_enable', False):
+            return None, {}
+        if coef <= 0:
+            return None, {'sft_ablation/coef': 0.0}
+
+        messages_list = batch.non_tensor_batch.get('rollout_messages', None)
+        if messages_list is None:
+            return None, {'sft_ablation/skipped_no_msgs': 1.0}
+
+        rewards = None
+        if 'traj_return' in batch.batch.keys():
+            rewards = batch.batch['traj_return'].tolist()
+        elif 'token_level_scores' in batch.batch.keys():
+            rewards = batch.batch['token_level_scores'].sum(dim=-1).tolist()
+
+        assembled, meta = build_sft_ablation_batch(
+            messages_list=list(messages_list),
+            tokenizer=self.tokenizer,
+            rewards=rewards,
+            gate=str(actor_cfg.get('sft_ablation_gate', 'wins')),
+            success_threshold=float(actor_cfg.get('sft_ablation_success_threshold', 0.5)),
+            max_length=int(actor_cfg.get('sft_ablation_max_length', 4096)),
+            max_samples_per_trajectory=actor_cfg.get('sft_ablation_max_samples_per_traj', None),
         )
         if assembled is None:
             return None, meta
@@ -1508,14 +1617,57 @@ class RayPPOTrainer(object):
                             print(f"[plan_forecast] skipped due to error: {e}", flush=True)
                             metrics['plan_forecast/error'] = 1.0
 
+                        # Optional SFT-ablation (RFT) control: one extra SFT round on
+                        # this step's WINNING trajectories, behavior-cloning the real
+                        # assistant turns. Mutually exclusive with plan_forecast (asserted
+                        # at init). Same optimizer path (update_actor_plan_forecast), only
+                        # the target differs -> a clean A/B against plan_forecast SFT.
+                        try:
+                            _acfg = self.config.actor_rollout_ref.actor
+                            if bool(_acfg.get('sft_ablation_enable', False)):
+                                abl_coef = float(_acfg.get('sft_ablation_coef', 0.01))
+                                metrics['sft_ablation/coef_sched'] = abl_coef
+                                sft_data, sft_meta = self._build_sft_ablation_dataproto(batch, abl_coef)
+                                metrics.update(sft_meta)
+                                if sft_data is not None and len(sft_data) > 0:
+                                    sft_data.meta_info['plan_forecast_coef'] = abl_coef
+                                    sft_data.meta_info['sft_metric_prefix'] = 'sft_ablation'
+                                    sft_padded, _sft_pad = pad_dataproto_to_divisor(
+                                        sft_data, self.actor_rollout_wg.world_size)
+                                    sft_padded.meta_info['plan_forecast_coef'] = abl_coef
+                                    sft_padded.meta_info['sft_metric_prefix'] = 'sft_ablation'
+                                    with _timer('update_sft_ablation', timing_raw):
+                                        sft_output = self.actor_rollout_wg.update_actor_plan_forecast(sft_padded)
+                                    metrics.update(reduce_metrics(sft_output.meta_info['metrics']))
+                                    metrics['sft_ablation/num_samples'] = len(sft_data)
+                                else:
+                                    metrics['sft_ablation/num_samples'] = 0
+                        except Exception as e:
+                            print(f"[sft_ablation] skipped due to error: {e}", flush=True)
+                            metrics['sft_ablation/error'] = 1.0
+
                         # Optional world-model SFT update on env-prediction data
                         # re-assembled with chat template from the rollout.
-                        if False:
+                        # Separate WM-SFT pass (predict env observations on a freshly
+                        # assembled batch). Gated strictly by world_model.enable
+                        # (default False => normal runs never touch this path). Used by
+                        # the WM-value experiment (C2/C3/C4); the C3 placebo lives in
+                        # _build_world_model_sft_dataproto behind world_model.placebo_shuffle.
+                        _wmcfg = self.config.actor_rollout_ref.actor.get('world_model', None)
+                        if _wmcfg is not None and bool(_wmcfg.get('enable', False)):
                             wm_data = self._build_world_model_sft_dataproto(batch)
                             if wm_data is not None and len(wm_data) > 0:
+                                # Decoupled coef: separate-pass strength independent of
+                                # the inline world_model_coeff, so the experiment can run
+                                # the separate WM-SFT with the inline path OFF
+                                # (WMC_COEFF=0 + world_model.sft_coef>0). Falls back to
+                                # world_model_coeff when sft_coef is unset.
+                                _wmsftcoef = float(_wmcfg.get('sft_coef', 0.0)) or \
+                                    float(self.config.actor_rollout_ref.actor.get('world_model_coeff', 0.0))
                                 # DP dispatch requires divisibility by world_size.
                                 wm_data_padded, _wm_pad = pad_dataproto_to_divisor(
                                     wm_data, self.actor_rollout_wg.world_size)
+                                wm_data_padded.meta_info['world_model_coeff'] = _wmsftcoef
                                 with _timer('update_world_model', timing_raw):
                                     wm_output = self.actor_rollout_wg.update_actor_world_model(wm_data_padded)
                                 wm_metrics = reduce_metrics(wm_output.meta_info['metrics'])

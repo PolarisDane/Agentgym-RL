@@ -3,28 +3,24 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BASE_PORT="${BASE_PORT:-36101}"
+BASE_PORT="${BASE_PORT:-8000}"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
-MODEL_PATH="${MODEL_PATH:-/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/ziyu/.cache/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28}"
+MODEL_PATH="${MODEL_PATH:-/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/ziyu/.cache/huggingface/hub/models--Qwen--Qwen2.5-3B-Instruct}"
 WANDB_MODE="${WANDB_MODE:-offline}"
-PROJECT_NAME="${PROJECT_NAME:-agentgym-webshop}"
+PROJECT_NAME="${PROJECT_NAME:-agentgym-babyai}"
 
-# Env-server processes per GPU. Each rank round-robins over its own shard of
-# servers, so >1 spreads a GPU's concurrent env stepping across processes/cores
-# instead of GIL-serialising it in one process. Must match the training script,
-# which builds ENVS_PER_GPU*NUM_GPUS addresses -- so ENVS_PER_GPU is forwarded.
-ENVS_PER_GPU="${ENVS_PER_GPU:-4}"
-IFS=',' read -r -a _GPU_ARR <<< "${CUDA_VISIBLE_DEVICES}"
-NUM_ENVS=$(( ${#_GPU_ARR[@]} * ENVS_PER_GPU ))
+# Calculate number of envs based on GPUs
+IFS=',' read -r -a GPU_ARRAY <<< "${CUDA_VISIBLE_DEVICES}"
+NUM_ENVS="${#GPU_ARRAY[@]}"
 
 export HF_HUB_OFFLINE=1
 export WANDB_MODE=offline
 
 RUN_TS="$(date -u +%Y%m%d_%H%M%S)"
-EXP_NAME="${EXP_NAME:-webshop_grpo_qwen2.5_3b_add_${RUN_TS}}"
+EXP_NAME="${EXP_NAME:-babyai_grpo_qwen2.5_3b_${RUN_TS}}"
 
-ENV_SESSION="webshop_env_cluster_${BASE_PORT}"
-TRAIN_SESSION="webshop_grpo_train"
+ENV_SESSION="babyai_env_cluster_${BASE_PORT}"
+TRAIN_SESSION="babyai_grpo_train"
 TRAIN_LOG="${ROOT}/runlogs/${EXP_NAME}/train.log"
 
 mkdir -p "${ROOT}/runlogs/${EXP_NAME}"
@@ -36,9 +32,9 @@ if tmux has-session -t "${TRAIN_SESSION}" 2>/dev/null; then
   tmux kill-session -t "${TRAIN_SESSION}"
 fi
 
-echo "Starting ${NUM_ENVS} WebShop Environment Services starting at port ${BASE_PORT}..."
+echo "Starting ${NUM_ENVS} BabyAI Environment Services starting at port ${BASE_PORT}..."
 tmux new-session -d -s "${ENV_SESSION}" \
-  "cd ${ROOT} && NUM_ENVS=${NUM_ENVS} BASE_PORT=${BASE_PORT} bash ${ROOT}/scripts/run_webshop_env_service.sh"
+  "cd ${ROOT} && NUM_ENVS=${NUM_ENVS} BASE_PORT=${BASE_PORT} bash ${ROOT}/scripts/run_babyai_env_service.sh"
 
 echo "Waiting for services to become healthy..."
 for i in $(seq 0 $((NUM_ENVS - 1))); do
@@ -53,7 +49,7 @@ for i in $(seq 0 $((NUM_ENVS - 1))); do
     sleep 2
   done
   if ! curl --noproxy '*' -sf "${ADDR}/" >/dev/null; then
-    echo "WebShop service on port ${PORT} failed to start."
+    echo "BabyAI service on port ${PORT} failed to start."
     exit 1
   fi
 done
@@ -61,7 +57,7 @@ done
 echo "Starting GRPO Training..."
 # Forward tuning env vars into the training tmux command, but only those that
 # are actually set in this shell — unset ones fall through to the defaults in
-# run_webshop_grpo_train.sh.
+# run_babyai_grpo_train.sh.
 FWD=""
 for v in ENABLE_ERC ERC_CLIPPING_METHOD ERC_CLIPPING_TYPE ERC_MOMENTUM UNCERTAINTY_SCALE_KAPPA UNCERTAINTY_SCALE_MIN UNCERTAINTY_SCALE_RENORMALIZE SAFE_COMMIT_MODE SAFE_COMMIT_OMEGA SAFE_COMMIT_RECENCY SAFE_COMMIT_RECENCY_GAMMA SAFE_COMMIT_SUCCESS_THRESHOLD SAFE_COMMIT_KAPPA SAFE_COMMIT_GMAX SAFE_COMMIT_GMIN SAFE_COMMIT_RENORMALIZE SAFE_COMMIT_TEXT_GATE SAFE_COMMIT_GATE_MODE SAFE_COMMIT_CLF_ENV SAFE_COMMIT_CLF_WINS_ONLY SAFE_COMMIT_CLF_MAX_NEW \
          WMLOSS_ADD_COEF WMLOSS_ADD_COEF_END WMLOSS_ADD_HORIZON \
@@ -75,10 +71,10 @@ for v in ENABLE_ERC ERC_CLIPPING_METHOD ERC_CLIPPING_TYPE ERC_MOMENTUM UNCERTAIN
 done
 echo "Forwarding overrides:${FWD:-<none>}"
 tmux new-session -d -s "${TRAIN_SESSION}" \
-  "cd ${ROOT} && CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} NUM_ENVS=${NUM_ENVS} ENVS_PER_GPU=${ENVS_PER_GPU} BASE_PORT=${BASE_PORT} MODEL_PATH=${MODEL_PATH} WANDB_MODE=${WANDB_MODE} PROJECT_NAME=${PROJECT_NAME} EXP_NAME=${EXP_NAME} LOG_PATH=${TRAIN_LOG}${FWD} bash ${ROOT}/scripts/run_webshop_grpo_train.sh"
+  "cd ${ROOT} && CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} BASE_PORT=${BASE_PORT} MODEL_PATH=${MODEL_PATH} WANDB_MODE=${WANDB_MODE} PROJECT_NAME=${PROJECT_NAME} EXP_NAME=${EXP_NAME} LOG_PATH=${TRAIN_LOG}${FWD} bash ${ROOT}/scripts/run_babyai_grpo_train.sh"
 
 echo "--------------------------------------------------"
-echo "WebShop Training Cluster Launched!"
+echo "BabyAI Training Cluster Launched!"
 echo "Number of Envs:      ${NUM_ENVS}"
 echo "Base Port:           ${BASE_PORT}"
 echo "Environment Session: ${ENV_SESSION}"
